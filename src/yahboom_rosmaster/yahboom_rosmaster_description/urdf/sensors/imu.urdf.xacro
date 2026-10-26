@@ -1,0 +1,111 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+    <xacro:property name="M_PI" value="3.1415926535897931" />
+
+    <xacro:macro name="imu_noise" params="axis stddev">
+        <xacro:if value="${float(stddev) > 0.0}">
+            <xacro:element xacro:name="${axis}">
+                <noise type="gaussian"><mean>0</mean><stddev>${stddev}</stddev></noise>
+            </xacro:element>
+        </xacro:if>
+    </xacro:macro>
+
+    <xacro:macro name="imu_sensor" params="
+        prefix:=''
+        parent:='base_link'
+        frame_id:='imu'
+        xyz_offset:='0 0 0'
+        rpy_offset:='0 0 0'
+        inertial_xyz_offset:='0 0 0'
+        inertial_rpy_offset:='0 0 0'
+        mass:=0.031
+        length:=0.03899
+        width:=0.03785
+        height:=0.01338
+        material_name:='imu_black'
+        material_color:='0.1 0.1 0.1 1'
+        gazebo_material_ambient:='0.1 0.1 0.1 1'
+        gazebo_material_diffuse:='0.1 0.1 0.1 1'
+        gazebo_material_specular:='0.1 0.1 0.1 1'
+        update_rate:='10.0'
+        gyro_noise_stddev_x:='0.0054'
+        gyro_noise_stddev_y:='0.0051'
+        gyro_noise_stddev_z:='0.0052'
+        accel_noise_stddev_x:='0.135'
+        accel_noise_stddev_y:='0.131'
+        accel_noise_stddev_z:='0.102'
+        topic_name:='imu/data'
+        always_on:=true
+        visualize:=false">
+
+        <xacro:property name="ixx" value="${(mass/12.0) * (height*height + width*width)}" />
+        <xacro:property name="iyy" value="${(mass/12.0) * (length*length + height*height)}" />
+        <xacro:property name="izz" value="${(mass/12.0) * (length*length + width*width)}" />
+
+        <link name="${prefix}${frame_id}_link">
+            <visual>
+                <origin xyz="0 0 0" rpy="0 0 0"/>
+                <geometry>
+                    <box size="${length} ${width} ${height}"/>
+                </geometry>
+                <material name="${material_name}">
+                    <color rgba="${material_color}"/>
+                </material>
+            </visual>
+
+            <inertial>
+                <mass value="${mass}" />
+                <origin xyz="${inertial_xyz_offset}" rpy="${inertial_rpy_offset}"/>
+                <inertia
+                    ixx="${ixx}"
+                    ixy="0.0"
+                    ixz="0.0"
+                    iyy="${iyy}"
+                    iyz="0.0"
+                    izz="${izz}" />
+            </inertial>
+        </link>
+
+        <joint name="${prefix}${frame_id}_joint" type="fixed">
+            <parent link="${prefix}${parent}"/>
+            <child link="${prefix}${frame_id}_link" />
+            <origin xyz="${xyz_offset}" rpy="${rpy_offset}"/>
+        </joint>
+
+        <gazebo reference="${prefix}${frame_id}_link">
+            <visual>
+                <material>
+                    <ambient>${gazebo_material_ambient}</ambient>
+                    <diffuse>${gazebo_material_diffuse}</diffuse>
+                    <specular>${gazebo_material_specular}</specular>
+                </material>
+            </visual>
+            <!-- Fortress-native IMU sensor. libgazebo_ros_imu_sensor.so is Classic-only
+                 and must not be used here. Data flows via ros_gz_bridge (gz.msgs.IMU →
+                 sensor_msgs/Imu). gz_ros2_control also reads this sensor through the ECS. -->
+            <sensor name="${prefix}imu_sensor" type="imu">
+                <imu>
+                    <!-- Per-axis Gaussian noise, as the physical robot's stationary
+                         capture measured it. A zero standard deviation (sensor_profile
+                         ideal) drops the noise element instead of writing one. -->
+                    <angular_velocity>
+                        <xacro:imu_noise axis="x" stddev="${gyro_noise_stddev_x}"/>
+                        <xacro:imu_noise axis="y" stddev="${gyro_noise_stddev_y}"/>
+                        <xacro:imu_noise axis="z" stddev="${gyro_noise_stddev_z}"/>
+                    </angular_velocity>
+                    <linear_acceleration>
+                        <xacro:imu_noise axis="x" stddev="${accel_noise_stddev_x}"/>
+                        <xacro:imu_noise axis="y" stddev="${accel_noise_stddev_y}"/>
+                        <xacro:imu_noise axis="z" stddev="${accel_noise_stddev_z}"/>
+                    </linear_acceleration>
+                </imu>
+                <update_rate>${update_rate}</update_rate>
+                <always_on>${always_on}</always_on>
+                <visualize>${visualize}</visualize>
+                <!-- Short topic name so ros_gz_bridge.yaml 'imu/data' entry matches -->
+                <topic>${topic_name}</topic>
+                <gz_frame_id>${prefix}${frame_id}_link</gz_frame_id>
+            </sensor>
+        </gazebo>
+    </xacro:macro>
+</robot>

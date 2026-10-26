@@ -1,0 +1,747 @@
+#!/usr/bin/env python3
+"""Validate the standalone simulator's public sensor and state contract."""
+
+from collections import deque
+import math
+import sys
+import time
+
+import numpy as np
+import rclpy
+from nav_msgs.msg import Odometry
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
+from rosgraph_msgs.msg import Clock
+from sensor_msgs.msg import CameraInfo, Image, Imu, JointState, LaserScan, PointCloud2
+from tf2_msgs.msg import TFMessage
+from tf2_ros import Buffer, TransformListener
+
+from cloud_timing_probe import layout_errors
+from depth_quality import FramePairs, depth_quality_errors, expectations_from_ledger
+from real_robot_contract import RealRobotContract
+
+
+EXPECTED_WHEEL_JOINTS = {
+    "front_left_wheel_joint",
+    "front_right_wheel_joint",
+    "back_left_wheel_joint",
+    "back_right_wheel_joint",
+}
+CAMERA_IMAGE_TOPICS = (
+    "/cam_1/color/image_raw",
+    "/cam_1/depth/image_raw",
+    "/cam_1/color/camera_info",
+    "/cam_1/depth/camera_info",
+)
+# Expected rates come from the simulator section of real_robot_contract.yaml.
+RATE_GRADED_TOPICS = (
+    "/scan",
+    "/imu/data",
+    *CAMERA_IMAGE_TOPICS,
+    "/cam_1/depth/color/points",
+    "/joint_states",
+    "/odom",
+)
+# The cloud arrives in whole-frame gaps, so its median period is one, two or
+# three frames depending on which few clouds a window catches. The mean rate
+# over the window is what the ledger's contract bounds.
+MEAN_RATE_TOPICS = ("/cam_1/depth/color/points",)
+# camera_info must reproduce the ledger's intrinsics to this many pixels.
+INTRINSICS_TOLERANCE = 1e-3
+# How far the probe's own /clock may trail a message, in sim seconds, and how
+# much beyond the one-period hold the physical profile's scan may arrive.
+CLOCK_SKEW_S = 0.02
+SCAN_LATE_MARGIN_S = 0.1
+REQUIRED_DYNAMIC_TF_EDGE = ("odom", "base_footprint")
+TIMESTAMPED_TF_TOPICS = (
+    "/scan",
+    "/imu/data",
+    "/cam_1/color/image_raw",
+    "/cam_1/depth/image_raw",
+    "/cam_1/color/camera_info",
+    "/cam_1/depth/camera_info",
+    "/cam_1/depth/color/points",
+    "/odom",
+)
+# The physical robot publishes every raw sensor stream as Best Effort
+# (qos_profile_sensor_data in yahboomcar_astra, SensorDataQoS in
+# sllidar_ros2). A consumer built for that contract silently receives
+# nothing from a Reliable topic, so the simulator must match here too.
+BEST_EFFORT_TOPICS = (
+    "/scan",
+    "/cam_1/color/image_raw",
+    "/cam_1/depth/image_raw",
+    "/cam_1/color/camera_info",
+    "/cam_1/depth/camera_info",
+    "/cam_1/depth/color/points",
+)
+
+
+# The depth the camera adapter is fed, before it conditions it. Reliable, and
+# only subscribed to (Best Effort, a few frames deep) while the depth quality is
+# graded, so the probe's own load stays out of the rest of the contract.
+RAW_DEPTH_TOPIC = "/internal/cam_1/depth/image_raw"
+PUBLIC_DEPTH_TOPIC = "/cam_1/depth/image_raw"
+DEPTH_HOLD_FRAMES = 5
+# Wall seconds the grading window may run once everything else is collected.
+DEPTH_GRADING_SECONDS = 8.0
+
+
+def validated_sample_count(value):
+    """Return at least the three samples the stamp and TF checks need."""
+    return max(3, int(value))
+
+
+def orientation_covariance_errors(covariance, diagonal):
+    """
+    Return the problems with /imu/data's orientation covariance.
+
+    imu_filter_madgwick fills the diagonal with orientation_stddev squared and
+    leaves the rest zero, as the robot's does; the ledger holds the diagonal.
+    """
+    expected = [0.0] * 9
+    for index, value in enumerate(diagonal):
+        expected[index * 4] = value
+    if len(covariance) != 9 or any(
+            abs(float(value) - want) > 1e-12
+            for value, want in zip(covariance, expected)):
+        return [
+            f"imu: orientation covariance {list(map(float, covariance))}, "
+            f"expected the diagonal {list(diagonal)}"]
+    return []
+
+
+def tf_window_size(camera_hz, odom_hz):
+    """
+    Return how many recent frames of a topic the TF check keeps.
+
+    The check passes when any kept frame resolves. Frames newer than the latest
+    odom -> base_footprint transform cannot resolve, and up to one odom period of
+    them (``camera_hz / odom_hz``, rounded up, plus one for a stamp on the far
+    side of a period) can be. The three the check always kept come on top.
+    """
+    return 3 + 1 + math.ceil(camera_hz / odom_hz)
+
+
+class SensorContractProbe(Node):
+    """Collect consecutive messages and validate their functional contract."""
+
+    def __init__(self):
+        super().__init__("sensor_contract_probe")
+        self.declare_parameter("timeout", 35.0)
+        self.declare_parameter("samples", 3)
+        self.declare_parameter("performance_checks", True)
+        # Which sensor profile the simulator runs, for the depth quality it must
+        # deliver, and how many stamp-matched frames to grade it on (0 skips it).
+        self.declare_parameter("sensor_profile", "physical")
+        self.declare_parameter("depth_quality_frames", -1)
+        self.timeout = float(self.get_parameter("timeout").value)
+        self.samples = validated_sample_count(
+            self.get_parameter("samples").value)
+        self.performance_checks = bool(
+            self.get_parameter("performance_checks").value)
+        self.sensor_profile = str(self.get_parameter("sensor_profile").value)
+        frames = int(self.get_parameter("depth_quality_frames").value)
+        self.depth_quality_frames = self.samples if frames < 0 else frames
+        self.depth_pairs = []
+
+        contract = RealRobotContract.load()
+        self.rate_contracts = {
+            topic: contract.rate_bounds(topic) for topic in RATE_GRADED_TOPICS
+        }
+        self.camera_horizontal_fov = contract.nominal(
+            "camera.horizontal_fov_rad")
+        self.expected_camera = {
+            key: contract.nominal(f"camera.{key}")
+            for key in (
+                "width", "height", "fx", "fy", "cx", "cy",
+                "distortion_model", "distortion_coefficients",
+            )
+        }
+        self.expected_frames = {
+            topic: contract.nominal(f"topics.{topic}.frame_id")
+            for topic in (
+                *CAMERA_IMAGE_TOPICS,
+                "/cam_1/depth/color/points",
+                "/scan",
+                "/imu/data",
+                "/joint_states",
+                "/odom",
+            )
+        }
+        self.expected_odom_child_frame = contract.nominal(
+            "topics./odom.child_frame_id")
+        self.expected_depth = expectations_from_ledger(contract)
+        self.imu_orientation_variance = contract.nominal(
+            "imu.orientation_covariance_diag")
+
+        self.required_counts = {
+            "/clock": self.samples,
+            "/scan": self.samples,
+            "/imu/data": self.samples,
+            "/cam_1/color/image_raw": self.samples,
+            "/cam_1/depth/image_raw": self.samples,
+            "/cam_1/color/camera_info": self.samples,
+            "/cam_1/depth/camera_info": self.samples,
+            "/cam_1/depth/color/points": self.samples,
+            "/joint_states": self.samples,
+            "/odom": self.samples,
+            "/tf": self.samples,
+            "/tf_static": 1,
+        }
+        self.messages = {topic: [] for topic in self.required_counts}
+        self.scan_lags = []
+        self.sim_now = None
+        # The odom -> base_footprint TF arrives once per /odom message, and tf2
+        # does not extrapolate, so up to one /odom period of the newest camera
+        # frames can be ahead of the latest transform. Keep that many more than
+        # the three samples the check always had, so that three older ones are
+        # still in the window (#43 step 8a: 30 Hz TF became 10 Hz). One frame
+        # more covers a stamp that lands on the far side of a period.
+        self.tf_window = tf_window_size(
+            contract.nominal("topics./cam_1/color/image_raw.rate_hz"),
+            contract.nominal("topics./odom.rate_hz"))
+        self.recent_tf_messages = {
+            topic: deque(maxlen=self.tf_window) for topic in TIMESTAMPED_TF_TOPICS
+        }
+        self.observed_dynamic_tf_edges = set()
+        self.started_at = time.monotonic()
+        self.first_arrivals = {}
+        self._subscription_handles = []
+
+        default_qos = QoSProfile(depth=20)
+        sensor_qos = QoSProfile(
+            depth=20,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
+        static_tf_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
+        topic_types = {
+            "/clock": Clock,
+            "/scan": LaserScan,
+            "/imu/data": Imu,
+            "/cam_1/color/image_raw": Image,
+            "/cam_1/depth/image_raw": Image,
+            "/cam_1/color/camera_info": CameraInfo,
+            "/cam_1/depth/camera_info": CameraInfo,
+            "/cam_1/depth/color/points": PointCloud2,
+            "/joint_states": JointState,
+            "/odom": Odometry,
+            "/tf": TFMessage,
+            "/tf_static": TFMessage,
+        }
+        sensor_topics = {
+            "/clock",
+            "/scan",
+            "/imu/data",
+            "/cam_1/color/image_raw",
+            "/cam_1/depth/image_raw",
+            "/cam_1/color/camera_info",
+            "/cam_1/depth/camera_info",
+            "/cam_1/depth/color/points",
+        }
+
+        for topic, message_type in topic_types.items():
+            if topic == "/tf_static":
+                qos = static_tf_qos
+            elif topic in sensor_topics:
+                qos = sensor_qos
+            else:
+                qos = default_qos
+            subscription = self.create_subscription(
+                message_type,
+                topic,
+                lambda message, topic_name=topic: self.capture(topic_name, message),
+                qos,
+            )
+            self._subscription_handles.append(subscription)
+
+        self.tf_buffer = Buffer(cache_time=Duration(seconds=20.0), node=self)
+        self.tf_listener = TransformListener(
+            self.tf_buffer, self, spin_thread=False)
+
+        if self.performance_checks:
+            self.get_logger().info(
+                f"Waiting up to {self.timeout:.1f}s for the standalone "
+                "sensor contract")
+        else:
+            self.get_logger().info(
+                f"Waiting up to {self.timeout:.1f}s for the "
+                "hardware-independent correctness sensor contract")
+
+    def capture(self, topic, message):
+        """Keep bounded samples and continuously track dynamic TF edges."""
+        self.first_arrivals.setdefault(topic, time.monotonic())
+        if topic == "/clock":
+            self.sim_now = (
+                float(message.clock.sec) + float(message.clock.nanosec) * 1e-9)
+        if topic == "/tf":
+            self.observed_dynamic_tf_edges.update(
+                (
+                    transform.header.frame_id.lstrip("/"),
+                    transform.child_frame_id.lstrip("/"),
+                )
+                for transform in message.transforms
+            )
+        if topic in self.recent_tf_messages:
+            # Keep exact-time TF lookups near the current simulation time. A
+            # software-rendered point cloud may lag the faster state topics,
+            # and a 30 Hz camera fills its primary samples within a third of
+            # a sim second, which can be before the TF listener has matched
+            # /tf. The primary evidence below remains frozen so early malformed
+            # messages cannot be hidden by later valid ones.
+            self.recent_tf_messages[topic].append(message)
+        if len(self.messages[topic]) < self.required_counts[topic]:
+            self.messages[topic].append(message)
+            if topic == "/scan":
+                # Sim time at receipt minus the capture stamp, aligned with the
+                # kept scans. This node runs on wall time, so sim time is the
+                # newest /clock message.
+                self.scan_lags.append(
+                    None if self.sim_now is None
+                    else self.sim_now - self.stamp_seconds(message))
+
+    def complete(self):
+        """Return whether all topics have produced the required samples."""
+        return (
+            all(
+                len(self.messages[topic]) >= count
+                for topic, count in self.required_counts.items()
+            )
+            and REQUIRED_DYNAMIC_TF_EDGE in self.observed_dynamic_tf_edges
+        )
+
+    @staticmethod
+    def depth_pixels(message):
+        """Return a 32FC1 depth image as a (height, width) float32 copy."""
+        if message.encoding != "32FC1":
+            raise ValueError(f"expected a 32FC1 depth image, got {message.encoding}")
+        rows = np.frombuffer(message.data, dtype="<f4").reshape(
+            message.height, message.step // 4)
+        return rows[:, :message.width].copy()
+
+    def collect_depth_quality(self, deadline):
+        """
+        Pair rendered and published depth images by exact stamp until enough arrive.
+
+        Subscribes to the adapter's raw input and to its public output for the
+        length of the window only, and holds a few frames of each, so a pair
+        is two views of one frame: the render is the truth the published depth
+        is graded against, with no geometry model in between.
+        """
+        self.depth_pairs = []
+        if self.depth_quality_frames <= 0:
+            return
+        pairing = FramePairs(DEPTH_HOLD_FRAMES)
+        qos = QoSProfile(
+            depth=DEPTH_HOLD_FRAMES, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+        def take(kind, message):
+            try:
+                pixels = self.depth_pixels(message)
+            except ValueError:
+                return
+            pairing.add(
+                kind, (message.header.stamp.sec, message.header.stamp.nanosec), pixels)
+            self.depth_pairs = pairing.pairs
+
+        subscriptions = [
+            self.create_subscription(
+                Image, RAW_DEPTH_TOPIC, lambda m: take("rendered", m), qos),
+            self.create_subscription(
+                Image, PUBLIC_DEPTH_TOPIC, lambda m: take("published", m), qos),
+        ]
+        try:
+            while (rclpy.ok() and time.monotonic() < deadline
+                   and len(self.depth_pairs) < self.depth_quality_frames):
+                rclpy.spin_once(self, timeout_sec=0.05)
+        finally:
+            for subscription in subscriptions:
+                self.destroy_subscription(subscription)
+
+    def depth_quality_problems(self):
+        """Return how the published depth departs from what the profile promises."""
+        if self.depth_quality_frames <= 0:
+            return []
+        if len(self.depth_pairs) < self.depth_quality_frames:
+            return [
+                f"depth quality: only {len(self.depth_pairs)}/"
+                f"{self.depth_quality_frames} rendered and published frames "
+                "were paired by stamp"]
+        notes = []
+        problems = depth_quality_errors(
+            self.depth_pairs, self.sensor_profile, self.expected_depth, notes)
+        self.get_logger().info(
+            f"Depth quality ({self.sensor_profile}) over {len(self.depth_pairs)} "
+            "frames: " + (
+                "; ".join(notes) if notes else "every finite pixel published as rendered"))
+        return [
+            f"depth quality ({self.sensor_profile}): {problem}" for problem in problems]
+
+    @staticmethod
+    def stamp_seconds(message):
+        """Extract a header timestamp as seconds."""
+        stamp = message.header.stamp
+        return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+    @staticmethod
+    def finite(values):
+        """Return whether every supplied numeric value is finite."""
+        return all(math.isfinite(float(value)) for value in values)
+
+    def validate_header(self, topic, errors):
+        """Validate frame IDs and monotonically increasing timestamps."""
+        messages = self.messages[topic]
+        stamps = [self.stamp_seconds(message) for message in messages]
+        if any(stamp <= 0.0 for stamp in stamps):
+            errors.append(f"{topic}: header timestamp is zero or negative")
+        if any(current <= previous for previous, current in zip(stamps, stamps[1:])):
+            errors.append(f"{topic}: header timestamps are not strictly increasing")
+        if any(not message.header.frame_id for message in messages):
+            errors.append(f"{topic}: frame_id is empty")
+
+    def validate_qos(self, topic, errors):
+        """Require the topic's publisher(s) to match the physical robot's QoS."""
+        infos = self.get_publishers_info_by_topic(topic)
+        if not infos:
+            errors.append(f"{topic}: no publisher info available for QoS check")
+            return
+        for info in infos:
+            reliability = info.qos_profile.reliability
+            if reliability != ReliabilityPolicy.BEST_EFFORT:
+                errors.append(
+                    f"{topic}: publisher '{info.node_name}' uses "
+                    f"{reliability.name} QoS, expected BEST_EFFORT to match "
+                    "the physical robot")
+
+    def validate_rate(self, topic, minimum, maximum, errors):
+        """Validate nominal rate from simulation timestamps."""
+        stamps = [self.stamp_seconds(message) for message in self.messages[topic]]
+        periods = [
+            current - previous
+            for previous, current in zip(stamps, stamps[1:])
+        ]
+        if not periods or any(period <= 0.0 for period in periods):
+            return
+        if topic in MEAN_RATE_TOPICS:
+            rate = len(periods) / sum(periods)
+        else:
+            sorted_periods = sorted(periods)
+            median_period = sorted_periods[len(sorted_periods) // 2]
+            rate = 1.0 / median_period
+        if not minimum <= rate <= maximum:
+            errors.append(
+                f"{topic}: measured {rate:.3f} Hz outside "
+                f"{minimum:.1f}..{maximum:.1f} Hz")
+
+    def validate_scan_latency(self, errors):
+        """
+        Grade how late each scan arrives against the sensor profile.
+
+        Under ``physical`` a scan is published when the next one arrives, so it
+        cannot be received before the next scan was captured: its lag is at
+        least the gap to the next stamp. That holds on any machine, since load
+        only adds delay. Under ``ideal`` it is published at once, so with the
+        machine keeping up (``performance_checks``) it arrives before the next
+        scan is even captured. A margin of CLOCK_SKEW_S covers the probe's
+        /clock arriving a little behind the scan.
+        """
+        scans = self.messages["/scan"]
+        stamps = [self.stamp_seconds(scan) for scan in scans]
+        held = self.sensor_profile == "physical"
+        for index, (stamp, following) in enumerate(zip(stamps, stamps[1:])):
+            gap, lag = following - stamp, self.scan_lags[index]
+            if lag is None:
+                continue
+            if held and lag < gap - CLOCK_SKEW_S:
+                errors.append(
+                    f"/scan: scan {index} arrived {lag:.3f}s after its stamp, "
+                    f"before the next scan was captured ({gap:.3f}s later); the "
+                    "physical profile publishes it when the next one arrives")
+                return
+            if held and self.performance_checks and lag > gap + SCAN_LATE_MARGIN_S:
+                errors.append(
+                    f"/scan: scan {index} arrived {lag:.3f}s after its stamp, "
+                    f"more than {SCAN_LATE_MARGIN_S}s beyond the {gap:.3f}s the "
+                    "physical profile holds it")
+                return
+            if (not held and self.performance_checks
+                    and lag >= gap - CLOCK_SKEW_S):
+                errors.append(
+                    f"/scan: scan {index} arrived {lag:.3f}s after its stamp, "
+                    f"a whole scan period ({gap:.3f}s) late; the ideal profile "
+                    "publishes it at once")
+                return
+
+    def validate_timestamped_tf(self, errors):
+        """
+        Require representative sensor frames to resolve at message time.
+
+        This is a deliberate loosening. It passes when any one of the recent
+        samples resolves, which is weaker than requiring every sample to.
+        Under software rendering the oldest can predate the TF listener's
+        first transform, and the newest can be ahead of the latest one, so
+        requiring all of them fails on timing, not on TF. What it no longer
+        catches is a stamp that is wrong for only some of the samples. A frame
+        missing from TF still fails, because it fails every sample.
+        """
+        for topic in TIMESTAMPED_TF_TOPICS:
+            messages = self.recent_tf_messages[topic]
+            frames = [
+                message.child_frame_id if topic == "/odom"
+                else message.header.frame_id
+                for message in messages
+            ]
+            if not any(
+                    self.tf_buffer.can_transform(
+                        "odom", frame, Time.from_msg(message.header.stamp),
+                        timeout=Duration(seconds=0.1))
+                    for frame, message in zip(frames, messages)):
+                stamps = ", ".join(
+                    f"{self.stamp_seconds(message):.9f}" for message in messages)
+                errors.append(
+                    f"{topic}: cannot resolve odom -> {frames[-1]} at any of "
+                    f"{stamps}")
+
+    def validate(self):
+        """Return contract errors after collection finishes."""
+        errors = []
+        for topic, required in self.required_counts.items():
+            received = len(self.messages[topic])
+            if received < required:
+                errors.append(f"{topic}: received {received}/{required} messages")
+        if errors:
+            return errors
+
+        clock_times = [
+            float(message.clock.sec) + float(message.clock.nanosec) * 1e-9
+            for message in self.messages["/clock"]
+        ]
+        if clock_times[0] <= 0.0 or any(
+                current <= previous
+                for previous, current in zip(clock_times, clock_times[1:])):
+            errors.append("/clock: simulation time is not positive and increasing")
+
+        header_topics = (
+            "/scan",
+            "/imu/data",
+            "/cam_1/color/image_raw",
+            "/cam_1/depth/image_raw",
+            "/cam_1/color/camera_info",
+            "/cam_1/depth/camera_info",
+            "/cam_1/depth/color/points",
+            "/joint_states",
+            "/odom",
+        )
+        for topic in header_topics:
+            self.validate_header(topic, errors)
+
+        for topic in BEST_EFFORT_TOPICS:
+            self.validate_qos(topic, errors)
+
+        self.validate_scan_latency(errors)
+
+        if self.performance_checks:
+            for topic, (minimum, maximum) in self.rate_contracts.items():
+                self.validate_rate(topic, minimum, maximum, errors)
+                first_latency = self.first_arrivals[topic] - self.started_at
+                if first_latency > 5.0:
+                    errors.append(
+                        f"{topic}: first message latency {first_latency:.3f}s "
+                        "exceeds 5s")
+
+        color = self.messages["/cam_1/color/image_raw"][-1]
+        depth = self.messages["/cam_1/depth/image_raw"][-1]
+        if color.encoding != "rgb8":
+            errors.append(f"color image: expected rgb8, got {color.encoding}")
+        if depth.encoding != "32FC1":
+            errors.append(f"depth image: expected 32FC1, got {depth.encoding}")
+        for topic in CAMERA_IMAGE_TOPICS:
+            frame = self.messages[topic][-1].header.frame_id
+            if frame != self.expected_frames[topic]:
+                errors.append(
+                    f"{topic}: expected frame {self.expected_frames[topic]}, "
+                    f"got {frame}")
+        expected_size = (
+            self.expected_camera["width"], self.expected_camera["height"])
+        for label, image in (("color", color), ("depth", depth)):
+            if (image.width, image.height) != expected_size:
+                errors.append(
+                    f"{label} image: {image.width}x{image.height}, expected "
+                    f"{expected_size[0]}x{expected_size[1]}")
+            if len(image.data) != image.step * image.height:
+                errors.append(f"{label} image: data length does not match step*height")
+
+        color_info = self.messages["/cam_1/color/camera_info"][-1]
+        depth_info = self.messages["/cam_1/depth/camera_info"][-1]
+        for label, info, image in (
+                ("color", color_info, color), ("depth", depth_info, depth)):
+            if (info.width, info.height) != (image.width, image.height):
+                errors.append(f"{label} camera info: dimensions do not match image")
+            if len(info.k) != 9 or not self.finite(info.k):
+                errors.append(f"{label} camera info: invalid intrinsic matrix")
+            else:
+                for name, index in (("fx", 0), ("fy", 4), ("cx", 2), ("cy", 5)):
+                    expected = self.expected_camera[name]
+                    if not math.isclose(
+                            info.k[index], expected,
+                            abs_tol=INTRINSICS_TOLERANCE):
+                        errors.append(
+                            f"{label} camera info: {name} {info.k[index]:.4f} "
+                            f"does not match the ledger's {expected:.4f}")
+                expected_focal_length = image.width / (
+                    2.0 * math.tan(self.camera_horizontal_fov / 2.0))
+                if not math.isclose(
+                        info.k[0], expected_focal_length, rel_tol=1e-5):
+                    errors.append(
+                        f"{label} camera info: fx {info.k[0]:.3f} does not "
+                        f"match image/FOV {expected_focal_length:.3f}")
+            if info.distortion_model != self.expected_camera["distortion_model"]:
+                errors.append(
+                    f"{label} camera info: distortion model "
+                    f"{info.distortion_model!r}, expected "
+                    f"{self.expected_camera['distortion_model']!r}")
+            if list(info.d) != self.expected_camera["distortion_coefficients"]:
+                errors.append(
+                    f"{label} camera info: distortion coefficients "
+                    f"{list(info.d)}, expected "
+                    f"{self.expected_camera['distortion_coefficients']}")
+            if len(info.p) != 12 or not self.finite(info.p):
+                errors.append(f"{label} camera info: invalid projection matrix")
+            elif not all(math.isclose(info.p[p_index], info.k[k_index])
+                         for p_index, k_index in ((0, 0), (2, 2), (5, 4), (6, 5))):
+                errors.append(
+                    f"{label} camera info: projection does not match intrinsics")
+            if info.header.frame_id != image.header.frame_id:
+                errors.append(f"{label} camera info: frame does not match image")
+
+        points = self.messages["/cam_1/depth/color/points"][-1]
+        cloud_frame = self.expected_frames["/cam_1/depth/color/points"]
+        if points.header.frame_id != cloud_frame:
+            errors.append(
+                f"point cloud: expected x-forward {cloud_frame}, got "
+                f"{points.header.frame_id}")
+        errors.extend(f"point cloud: {problem}" for problem in layout_errors(points))
+        if points.width == 0 or points.height == 0 or not points.data:
+            errors.append("point cloud: dimensions or data are empty")
+
+        scan = self.messages["/scan"][-1]
+        if scan.header.frame_id != self.expected_frames["/scan"]:
+            errors.append(
+                f"scan: expected {self.expected_frames['/scan']}, got "
+                f"{scan.header.frame_id}")
+        if not scan.ranges or scan.angle_increment <= 0.0:
+            errors.append("scan: ranges are empty or angle increment is invalid")
+        if not 0.0 < scan.range_min < scan.range_max:
+            errors.append("scan: range bounds are invalid")
+        if not self.finite((
+                scan.angle_min, scan.angle_max, scan.angle_increment,
+                scan.range_min, scan.range_max)):
+            errors.append("scan: metadata contains non-finite values")
+
+        imu = self.messages["/imu/data"][-1]
+        if imu.header.frame_id != self.expected_frames["/imu/data"]:
+            errors.append(
+                f"imu: expected {self.expected_frames['/imu/data']}, got "
+                f"{imu.header.frame_id}")
+        imu_values = (
+            imu.angular_velocity.x, imu.angular_velocity.y, imu.angular_velocity.z,
+            imu.linear_acceleration.x, imu.linear_acceleration.y,
+            imu.linear_acceleration.z,
+        )
+        if not self.finite(imu_values):
+            errors.append("imu: motion values contain non-finite values")
+        errors.extend(orientation_covariance_errors(
+            imu.orientation_covariance, self.imu_orientation_variance))
+        gravity = math.sqrt(
+            imu.linear_acceleration.x ** 2 +
+            imu.linear_acceleration.y ** 2 +
+            imu.linear_acceleration.z ** 2)
+        if not 5.0 < gravity < 15.0:
+            errors.append(f"imu: stationary acceleration magnitude is {gravity:.3f}")
+
+        joints = self.messages["/joint_states"][-1]
+        if joints.header.frame_id != self.expected_frames["/joint_states"]:
+            errors.append(
+                f"joint states: expected frame {self.expected_frames['/joint_states']}, "
+                f"got {joints.header.frame_id}")
+        if not EXPECTED_WHEEL_JOINTS.issubset(set(joints.name)):
+            errors.append(f"joint states: missing wheel joints from {joints.name}")
+        if len(joints.position) < len(joints.name):
+            errors.append("joint states: missing position values")
+        if len(joints.velocity) < len(joints.name):
+            errors.append("joint states: missing velocity values")
+
+        odometry = self.messages["/odom"][-1]
+        if odometry.header.frame_id != self.expected_frames["/odom"]:
+            errors.append(
+                f"odom: expected frame {self.expected_frames['/odom']}, got "
+                f"{odometry.header.frame_id}")
+        if odometry.child_frame_id != self.expected_odom_child_frame:
+            errors.append(
+                f"odom: expected child {self.expected_odom_child_frame}, got "
+                f"{odometry.child_frame_id}")
+
+        if REQUIRED_DYNAMIC_TF_EDGE not in self.observed_dynamic_tf_edges:
+            errors.append("/tf: odom -> base_footprint transform was not observed")
+
+        static_children = {
+            transform.child_frame_id
+            for message in self.messages["/tf_static"]
+            for transform in message.transforms
+        }
+        required_static_frames = {
+            "base_link", "laser_link", "imu_link",
+            "cam_1_depth_optical_frame", "cam_1_color_optical_frame",
+        }
+        missing_static = required_static_frames - static_children
+        if missing_static:
+            errors.append(f"/tf_static: missing frames {sorted(missing_static)}")
+
+        self.validate_timestamped_tf(errors)
+        errors.extend(self.depth_quality_problems())
+
+        return errors
+
+    def summary(self):
+        """Return a compact message-count summary."""
+        return ", ".join(
+            f"{topic}={len(messages)}"
+            for topic, messages in self.messages.items()
+        )
+
+
+def main():
+    rclpy.init()
+    node = SensorContractProbe()
+    deadline = time.monotonic() + node.timeout
+    try:
+        while rclpy.ok() and time.monotonic() < deadline and not node.complete():
+            rclpy.spin_once(node, timeout_sec=0.2)
+        # Let dynamic TF advance beyond the newest collected sensor samples.
+        tf_deadline = min(deadline, time.monotonic() + 0.5)
+        while rclpy.ok() and time.monotonic() < tf_deadline:
+            rclpy.spin_once(node, timeout_sec=0.05)
+        if node.complete():
+            node.collect_depth_quality(time.monotonic() + DEPTH_GRADING_SECONDS)
+        errors = node.validate()
+        if errors:
+            node.get_logger().error("Sensor contract FAILED: " + "; ".join(errors))
+            node.get_logger().error("Received: " + node.summary())
+            return 1
+        node.get_logger().info("Sensor contract PASSED: " + node.summary())
+        return 0
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

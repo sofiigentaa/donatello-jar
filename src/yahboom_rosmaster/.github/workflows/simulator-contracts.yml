@@ -1,0 +1,135 @@
+name: Simulator contracts
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: simulator-contracts-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  headless-contracts:
+    name: ROS 2 Humble / Gazebo Fortress
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    container:
+      image: ros:humble-ros-base-jammy
+      options: --shm-size=2g
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      GALLIUM_DRIVER: llvmpipe
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      QT_QPA_PLATFORM: xcb
+      ROS_DISTRO: humble
+      ROS_DOMAIN_ID: "42"
+      ROS_LOG_DIR: ${{ github.workspace }}/artifacts/ros-logs
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Gazebo Fortress and workspace dependencies
+        shell: bash
+        run: |
+          source /opt/ros/humble/setup.bash
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ignition-fortress \
+            libgl1-mesa-dri \
+            mesa-utils \
+            git \
+            python3-colcon-common-extensions \
+            python3-rosdep \
+            ros-humble-gz-ros2-control \
+            xauth \
+            xvfb
+          if [[ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]]; then
+            rosdep init
+          fi
+          rosdep update --rosdistro humble
+          # The gate is headless (every launch test passes rviz:=false), so skip
+          # the GUI tools. rosdep installs the ros_gz_* packages that package.xml
+          # declares; the ros-humble-ros-gz metapackage is left out on purpose,
+          # because its sim-demos dependency pulls in rviz2 and rqt.
+          rosdep install \
+            --from-paths . \
+            --ignore-src \
+            --rosdistro humble \
+            --skip-keys "rviz2 rqt_robot_steering rviz_imu_plugin joint_state_publisher_gui" \
+            --default-yes
+
+      - name: Verify simulator environment
+        shell: bash
+        run: |
+          source /opt/ros/humble/setup.bash
+          test "$(ign gazebo --versions | cut -d. -f1)" = "6"
+          ros2 pkg prefix ros_gz_sim
+          ros2 pkg prefix gz_ros2_control
+          mkdir -p "${ROS_LOG_DIR}"
+
+      - name: Build supported packages
+        shell: bash
+        run: |
+          source /opt/ros/humble/setup.bash
+          # No --symlink-install: CI installs once, and symlinking the ~2,500
+          # model files one at a time costs ~20 s more than copying them.
+          colcon build \
+            --event-handlers console_direct+ \
+            --cmake-args -DBUILD_TESTING=ON
+
+      # The gate runs physical_rosmaster's own contract probe against the
+      # simulator (#43 step 9). The pin is the ledger's, so there is one place
+      # to move it. git is installed above so that the checkout below is a real
+      # repository the tests can `git show` the probe from.
+      - name: Read the physical_rosmaster pin
+        id: physical_pin
+        shell: bash
+        run: |
+          sha="$(python3 -c "import yaml; print(yaml.safe_load(open('yahboom_rosmaster_gazebo/config/real_robot_contract.yaml'))['physical']['provenance']['commit'])")"
+          if [[ ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "The ledger's physical commit is not a full SHA: '${sha}'" >&2
+            exit 1
+          fi
+          echo "physical_rosmaster pin: ${sha}"
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+
+      # After the build, so colcon never scans it. Only the probe is checked out.
+      - name: Fetch the physical contract probe at the pin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: AIRclub-UdeSA/physical_rosmaster
+          ref: ${{ steps.physical_pin.outputs.sha }}
+          path: physical_rosmaster
+          sparse-checkout: tools/physical_contract_probe.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Run representative headless contracts
+        shell: bash
+        timeout-minutes: 14
+        env:
+          PHYSICAL_ROSMASTER_REPO: ${{ github.workspace }}/physical_rosmaster
+        run: |
+          xvfb-run \
+            --auto-servernum \
+            --server-args="-screen 0 1280x1024x24 -nolisten tcp" \
+            bash scripts/test_simulator_contracts.sh
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: simulator-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/**/test_results/**
+            build/**/Testing/**
+            log/**
+            artifacts/ros-logs/**

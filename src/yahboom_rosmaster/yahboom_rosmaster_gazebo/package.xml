@@ -1,0 +1,55 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>yahboom_rosmaster_gazebo</name>
+  <version>0.0.0</version>
+  <description>Gazebo simulation support for Yahboom ROSMASTER robots including worlds and launch files</description>
+  <maintainer email="automaticaddison@todo.com">ubuntu</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>controller_manager</depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>yahboom_rosmaster_description</exec_depend>
+
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <depend>python3-numpy</depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <depend>rclcpp</depend>
+  <exec_depend>rosbag2_py</exec_depend>
+  <depend>ros2_control</depend>
+  <exec_depend>gz_ros2_control</exec_depend>
+  <exec_depend>imu_filter_madgwick</exec_depend>
+  <exec_depend>ros_gz_sim</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>ros_gz_image</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
+  <depend>ros2_controllers</depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>tf2_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <depend>trajectory_msgs</depend>
+  <depend>xacro</depend>
+  <exec_depend>topic_tools</exec_depend>
+
+  <exec_depend>rqt_robot_steering</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>rviz_imu_plugin</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>launch_testing</test_depend>
+  <test_depend>launch_testing_ament_cmake</test_depend>
+  <test_depend>lifecycle_msgs</test_depend>
+  <test_depend>nav2_map_server</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

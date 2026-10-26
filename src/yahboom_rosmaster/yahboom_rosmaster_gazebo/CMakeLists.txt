@@ -1,0 +1,382 @@
+cmake_minimum_required(VERSION 3.8)
+project(yahboom_rosmaster_gazebo)
+
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+# find dependencies
+find_package(ament_cmake REQUIRED)
+
+# Copy necessary files to designated locations in the project
+install(
+  DIRECTORY config launch maps models rviz scripts worlds
+  DESTINATION share/${PROJECT_NAME}
+)
+
+install(
+  PROGRAMS
+    scripts/base_feedback_probe.py
+    scripts/camera_adapter.py
+    scripts/cloud_timing_probe.py
+    scripts/depth_geometry_probe.py
+    scripts/ground_truth_contract_probe.py
+    scripts/ground_truth_display_probe.py
+    scripts/imu_motion_probe.py
+    scripts/imu_raw_relay.py
+    scripts/lidar_geometry_probe.py
+    scripts/map_server_smoke_probe.py
+    scripts/motion_profile_divergence_probe.py
+    scripts/real_robot_bag_analyzer.py
+    scripts/sensor_contract_probe.py
+    scripts/spawn_pose_contract_probe.py
+    scripts/wheel_odometry_resilience_probe.py
+    scripts/world_smoke_probe.py
+    scripts/cmd_vel_watchdog.py
+    scripts/wheel_state_odometry.py
+    scripts/calculated_odometry.py
+    scripts/ground_truth_tf.py
+    scripts/sensor_qos_relay.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  FILES
+    scripts/cloud_timing.py
+    scripts/command_limits.py
+    scripts/depth_quality.py
+    scripts/ground_truth_alignment.py
+    scripts/real_robot_contract.py
+    scripts/sensor_profiles.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+if(BUILD_TESTING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  find_package(ament_lint_auto REQUIRED)
+  find_package(launch_testing_ament_cmake REQUIRED)
+  # the following line skips the linter which checks for copyrights
+  # comment the line when a copyright and license is added to all source files
+  set(ament_cmake_copyright_FOUND TRUE)
+  # the following line skips cpplint (only works in a git repo)
+  # comment the line when this package is in a git repo and when
+  # a copyright and license is added to all source files
+  set(ament_cmake_cpplint_FOUND TRUE)
+  ament_lint_auto_find_test_dependencies()
+  add_test(
+    NAME motion_profile_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/motion_profile_contract_test.py
+  )
+  add_test(
+    NAME launch_argument_consistency
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/launch_argument_consistency_test.py
+  )
+  add_test(
+    NAME python_node_clock_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/python_node_clock_test.py
+  )
+  add_test(
+    NAME ground_truth_alignment_math
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/ground_truth_alignment_test.py
+  )
+  add_test(
+    NAME map_assets_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/map_assets_test.py
+  )
+  # Auto-discovers every maps/*.yaml at launch-generation time -- a single
+  # target covering all of them, not one target per map (see #40: the
+  # per-map world_smoke_* targets below never made it into the CI filter in
+  # scripts/test_simulator_contracts.sh, so a new map here would silently
+  # get zero coverage under that pattern).
+  add_launch_test(
+    test/map_server_smoke.launch.py
+    TARGET map_server_smoke
+    TIMEOUT 120
+  )
+  add_test(
+    NAME practice_world_probe_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/world_smoke_probe_test.py
+  )
+  add_test(
+    NAME launch_shutdown_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/launch_shutdown_test.py
+  )
+  add_test(
+    NAME sensor_contract_probe_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/sensor_contract_probe_test.py
+  )
+  add_test(
+    NAME sensor_profiles_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/sensor_profiles_test.py
+  )
+  add_test(
+    NAME cloud_timing_probe_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/cloud_timing_probe_test.py
+  )
+  add_test(
+    NAME cloud_timing_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/cloud_timing_test.py
+  )
+  add_test(
+    NAME camera_adapter_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/camera_adapter_test.py
+  )
+  add_test(
+    NAME depth_quality_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/depth_quality_test.py
+  )
+  add_test(
+    NAME measurement_tools_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/measurement_tools_test.py
+  )
+  add_test(
+    NAME sensor_qos_relay_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/sensor_qos_relay_test.py
+  )
+  add_test(
+    NAME command_limits_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/command_limits_test.py
+  )
+  add_test(
+    NAME wheel_state_odometry_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/wheel_state_odometry_test.py
+  )
+  add_test(
+    NAME imu_raw_relay_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/imu_raw_relay_test.py
+  )
+  add_test(
+    NAME imu_filter_config_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/imu_filter_config_test.py
+  )
+  add_test(
+    NAME classic_launch_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/classic_launch_contract_test.py
+  )
+  add_test(
+    NAME physical_probe_pin_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/physical_probe_pin_test.py
+  )
+  # Installed code must find its data without the source tree (copy installs).
+  add_test(
+    NAME installed_paths_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/installed_paths_test.py
+  )
+  add_test(
+    NAME real_robot_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/real_robot_contract_test.py
+  )
+  add_launch_test(
+    test/sensor_contract.launch.py
+    TARGET sensor_contract_empty
+    TIMEOUT 90
+    ARGS "world:=empty.world"
+  )
+  add_launch_test(
+    test/sensor_contract.launch.py
+    TARGET sensor_contract_cafe
+    TIMEOUT 90
+    ARGS "world:=cafe.world"
+  )
+  # The ideal profile publishes the render bit for bit on every finite pixel.
+  # Full suite only: the physical targets carry the same probe in the CI gate.
+  add_launch_test(
+    test/sensor_contract.launch.py
+    TARGET sensor_contract_empty_ideal
+    TIMEOUT 90
+    ARGS "world:=empty.world" "sensor_profile:=ideal"
+  )
+  # Hosted runners use software rendering, where message delivery rate reflects
+  # runner load rather than sensor correctness.
+  # Keep the strict empty/cafe targets above for local performance validation.
+  add_launch_test(
+    test/sensor_contract.launch.py
+    TARGET sensor_contract_ci
+    TIMEOUT 150
+    ARGS
+      "world:=empty.world"
+      "samples:=3"
+      "performance_checks:=false"
+      "cloud_timing_seconds:=15"
+  )
+  # The cloud's gap distribution and latency, graded on sim time over a long
+  # window. The CI gate grades a shorter one inside sensor_contract_ci.
+  add_launch_test(
+    test/cloud_timing.launch.py
+    TARGET cloud_timing_physical
+    TIMEOUT 200
+    ARGS "sensor_profile:=physical" "duration:=60"
+  )
+  add_launch_test(
+    test/cloud_timing.launch.py
+    TARGET cloud_timing_ideal
+    TIMEOUT 90
+    ARGS "sensor_profile:=ideal" "duration:=10" "cloud_decimation:=4"
+  )
+  add_launch_test(
+    test/base_feedback.launch.py
+    TARGET base_feedback
+    TIMEOUT 90
+  )
+  add_launch_test(
+    test/depth_geometry.launch.py
+    TARGET depth_geometry
+    TIMEOUT 90
+  )
+  add_launch_test(
+    test/ground_truth_contract.launch.py
+    TARGET ground_truth_contract
+    TIMEOUT 90
+  )
+  add_launch_test(
+    test/ground_truth_display.launch.py
+    TARGET ground_truth_display
+    TIMEOUT 30
+  )
+  add_launch_test(
+    test/ground_truth_odom_mode.launch.py
+    TARGET ground_truth_odom_mode
+    TIMEOUT 30
+  )
+  add_launch_test(
+    test/ground_truth_map_mode.launch.py
+    TARGET ground_truth_map_mode
+    TIMEOUT 30
+  )
+  add_launch_test(
+    test/spawn_pose_contract.launch.py
+    TARGET spawn_pose_contract
+    TIMEOUT 90
+  )
+  add_launch_test(
+    test/motion_profile_divergence.launch.py
+    TARGET motion_profile_divergence_ideal
+    TIMEOUT 100
+    ARGS "motion_profile:=ideal" "min_error:=0.0" "max_error:=0.0005"
+  )
+  add_launch_test(
+    test/motion_profile_divergence.launch.py
+    TARGET motion_profile_divergence_stress
+    TIMEOUT 100
+    ARGS "motion_profile:=stress" "min_error:=0.003" "max_error:=0.030"
+  )
+  add_launch_test(
+    test/motion_profile_divergence.launch.py
+    TARGET motion_profile_yaw_ideal
+    TIMEOUT 100
+    ARGS
+      "motion_profile:=ideal"
+      "motion:=yaw"
+      "command_speed:=0.4"
+      "meaningful_yaw:=0.8"
+      "max_yaw_error:=0.005"
+  )
+  add_launch_test(
+    test/lidar_geometry.launch.py
+    TARGET lidar_geometry
+    TIMEOUT 90
+  )
+  # The ideal profile has no IMU noise, so the motion checks run on the sensor's
+  # own readings, and the stationary raw stream must show none.
+  add_launch_test(
+    test/imu_motion.launch.py
+    TARGET imu_motion
+    TIMEOUT 90
+    ARGS "sensor_profile:=ideal" "noise_samples:=100"
+  )
+  # The physical profile's per-axis noise, graded on 200 stationary raw samples.
+  add_launch_test(
+    test/imu_motion.launch.py
+    TARGET imu_noise
+    TIMEOUT 90
+    ARGS "sensor_profile:=physical" "noise_samples:=200" "skip_motion:=true"
+  )
+  # The motion semantics must also hold through the physical noise and the filter.
+  add_launch_test(
+    test/imu_motion.launch.py
+    TARGET imu_motion_physical
+    TIMEOUT 90
+    ARGS "sensor_profile:=physical"
+  )
+  add_launch_test(
+    test/wheel_odometry_resilience.launch.py
+    TARGET wheel_odometry_resilience
+    TIMEOUT 40
+  )
+  # Practice worlds: lightweight spawn/collision/movement/interface smoke only.
+  # Rate and message-shape contracts stay on the two reference worlds above.
+  add_launch_test(
+    test/world_smoke.launch.py
+    TARGET world_smoke_laberinto_simple
+    TIMEOUT 70
+    ARGS "world:=laberinto_simple.world"
+  )
+  add_launch_test(
+    test/world_smoke.launch.py
+    TARGET world_smoke_laberinto_simple_victimas
+    TIMEOUT 70
+    ARGS "world:=laberinto_simple_victimas.world"
+  )
+  add_launch_test(
+    test/world_smoke.launch.py
+    TARGET world_smoke_laberinto_1
+    TIMEOUT 70
+    ARGS "world:=laberinto_1.world"
+  )
+  add_launch_test(
+    test/world_smoke.launch.py
+    TARGET world_smoke_laberinto_1_victimas
+    TIMEOUT 70
+    ARGS "world:=laberinto_1_victimas.world"
+  )
+  add_launch_test(
+    test/world_smoke.launch.py
+    TARGET world_smoke_maze_1
+    TIMEOUT 70
+    ARGS "world:=maze_1_6x5.world"
+  )
+  add_launch_test(
+    test/world_smoke.launch.py
+    TARGET world_smoke_maze_1_victimas
+    TIMEOUT 70
+    ARGS "world:=maze_1_6x5_victimas.world"
+  )
+  add_launch_test(
+    test/world_smoke.launch.py
+    TARGET world_smoke_maze_2
+    TIMEOUT 70
+    ARGS "world:=maze_2_6x5.world"
+  )
+  add_launch_test(
+    test/world_smoke.launch.py
+    TARGET world_smoke_maze_2_victimas
+    TIMEOUT 70
+    ARGS "world:=maze_2_6x5_victimas.world"
+  )
+  add_launch_test(
+    test/world_smoke.launch.py
+    TARGET world_smoke_maze_3
+    TIMEOUT 70
+    ARGS "world:=maze_3_6x6.world"
+  )
+  add_launch_test(
+    test/world_smoke.launch.py
+    TARGET world_smoke_maze_3_victimas
+    TIMEOUT 70
+    ARGS "world:=maze_3_6x6_victimas.world"
+  )
+  add_launch_test(
+    test/world_smoke.launch.py
+    TARGET world_smoke_maze_4
+    TIMEOUT 70
+    ARGS "world:=maze_4_metal_6x6.world"
+  )
+  add_launch_test(
+    test/world_smoke.launch.py
+    TARGET world_smoke_maze_4_victimas
+    TIMEOUT 70
+    ARGS "world:=maze_4_metal_6x6_victimas.world"
+  )
+endif()
+
+ament_package()

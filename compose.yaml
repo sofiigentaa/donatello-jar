@@ -1,0 +1,18 @@
+services:
+  donatello:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: donatello-jar:dev
+    container_name: donatello-jar
+    network_mode: host
+    stdin_open: true
+    tty: true
+    working_dir: /root/donatello_ws
+    volumes:
+      - ./:/root/donatello_ws
+    environment:
+      - ROS_DOMAIN_ID=0
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+    command: /bin/bash

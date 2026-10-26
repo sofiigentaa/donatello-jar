@@ -1,0 +1,31 @@
+controller_manager:
+  ros__parameters:
+    # The loop stays at 30 Hz. The physical robot's /joint_states, and with it
+    # /odom and the odom -> base_footprint TF, arrive at 10 Hz (#43 step 8a);
+    # joint_state_broadcaster below runs every third cycle. gz_ros2_control
+    # only reads state here, since native MecanumDrive owns the wheel commands.
+    #
+    # History: at 50 Hz, Fast DDS could deliver consecutive /joint_states
+    # messages slightly out of order under CPU load, so robot_state_publisher
+    # emitted TF with a decreasing timestamp and every TF listener logged
+    # TF_OLD_DATA. The loop rate that was measured safe is 30 Hz; the published
+    # rate is now lower still.
+    update_rate: 30  # Hz
+    use_sim_time: true
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+joint_state_broadcaster:
+  ros__parameters:
+    # joint_state_broadcaster has no publish_rate parameter (Humble's
+    # ros2_controllers 2.54 generates only joints, interfaces, extra_joints,
+    # use_local_topics and the like), so a publish_rate here was always ignored
+    # and its 30 Hz came from the controller manager's update_rate. Every
+    # controller does honour its own update_rate, which is what sets the rate.
+    # The loop steps are 34 ms, so the stamps come 102 ms apart (9.80 Hz).
+    update_rate: 10  # Hz
+    # The broadcaster's frame_id defaults to base_link. The robot's driver
+    # publishes "joint_states" (Mcnamu_driver_X3.py:508), and so does the
+    # simulator now (#43 step 9; the physical contract probe needs it non-empty).
+    frame_id: joint_states

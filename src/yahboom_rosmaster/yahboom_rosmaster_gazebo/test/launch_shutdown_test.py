@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""Focused unit tests for dependency-aware simulator shutdown helpers."""
+
+import ast
+import importlib.util
+import os
+from pathlib import Path
+import signal
+import tempfile
+import time
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import shutdown_asserts
+import sim_timing
+
+
+LAUNCH_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "launch"
+    / "rosmaster_gazebo_fortress.launch.py"
+)
+SPEC = importlib.util.spec_from_file_location("rosmaster_gazebo_fortress", LAUNCH_FILE)
+LAUNCH_MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(LAUNCH_MODULE)
+NON_RENDERING_CONTRACTS = (
+    "base_feedback.launch.py",
+    "ground_truth_contract.launch.py",
+    "imu_motion.launch.py",
+    "motion_profile_divergence.launch.py",
+)
+
+
+class RecordingLogger:
+    """Collect helper logs without depending on launch's logging backend."""
+
+    def __init__(self):
+        self.debug_messages = []
+        self.info_messages = []
+        self.warning_messages = []
+
+    def debug(self, message):
+        self.debug_messages.append(message)
+
+    def info(self, message):
+        self.info_messages.append(message)
+
+    def warning(self, message):
+        self.warning_messages.append(message)
+
+
+class FakeProcess:
+    """Expose the two launch-process properties used by the helpers."""
+
+    def __init__(self, return_code=None, process_details=None):
+        self.return_code = return_code
+        self.process_details = process_details
+
+
+class TestLaunchShutdown(unittest.TestCase):
+    """Require the image consumer to stop before Gazebo is torn down."""
+
+    def test_render_only_nodes_follow_render_sensors_flag(self):
+        tree = ast.parse(LAUNCH_FILE.read_text(encoding="utf-8"))
+        assignments = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if isinstance(target, ast.Name):
+                assignments[target.id] = node.value
+
+        render_sensors = assignments["render_sensors"]
+        self.assertIsInstance(render_sensors, ast.Call)
+        self.assertEqual(render_sensors.func.id, "LaunchConfiguration")
+        self.assertEqual(ast.literal_eval(render_sensors.args[0]), "render_sensors")
+
+        for action_name in ("ros_gz_image_bridge", "camera_adapter"):
+            with self.subTest(action=action_name):
+                action = assignments[action_name]
+                conditions = [
+                    keyword.value
+                    for keyword in action.keywords
+                    if keyword.arg == "condition"
+                ]
+                self.assertEqual(len(conditions), 1)
+                condition = conditions[0]
+                self.assertIsInstance(condition, ast.Call)
+                self.assertEqual(condition.func.id, "IfCondition")
+                self.assertEqual(len(condition.args), 1)
+                self.assertEqual(condition.args[0].id, "render_sensors")
+
+    def test_non_rendering_contracts_disable_rendered_sensors(self):
+        test_directory = Path(__file__).resolve().parent
+        for filename in NON_RENDERING_CONTRACTS:
+            with self.subTest(contract=filename):
+                tree = ast.parse(
+                    (test_directory / filename).read_text(encoding="utf-8"))
+                render_values = []
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Dict):
+                        continue
+                    for key, value in zip(node.keys, node.values):
+                        if (isinstance(key, ast.Constant)
+                                and key.value == "render_sensors"):
+                            render_values.append(ast.literal_eval(value))
+                self.assertEqual(render_values, ["false"])
+
+    def test_proc_unavailable_probes_live_pid(self):
+        process = FakeProcess(process_details={"pid": 123})
+
+        with (
+            patch("builtins.open", side_effect=FileNotFoundError),
+            patch.object(LAUNCH_MODULE.os.path, "isdir", return_value=False),
+            patch.object(LAUNCH_MODULE.os, "kill") as kill,
+        ):
+            stopped = LAUNCH_MODULE._process_stopped(process)
+
+        self.assertFalse(stopped)
+        kill.assert_called_once_with(123, 0)
+
+    def test_proc_unavailable_detects_missing_pid(self):
+        process = FakeProcess(process_details={"pid": 123})
+
+        with (
+            patch("builtins.open", side_effect=FileNotFoundError),
+            patch.object(LAUNCH_MODULE.os.path, "isdir", return_value=False),
+            patch.object(
+                LAUNCH_MODULE.os, "kill", side_effect=ProcessLookupError),
+        ):
+            stopped = LAUNCH_MODULE._process_stopped(process)
+
+        self.assertTrue(stopped)
+
+    @unittest.skipUnless(os.path.isdir("/proc"), "requires /proc (Linux)")
+    def test_zombie_child_is_not_stopped_until_reaped(self):
+        # Regression test for the reap race (issue #31): /proc reports a
+        # zombie (state Z) well before the process is actually reapable, and
+        # treating Z as "stopped" let launch's own SIGINT dispatch race
+        # asyncio's watcher thread to reap the child first, misreporting its
+        # exit code. Forks a real child that exits immediately, confirms it
+        # is observed as a zombie, and checks that _process_stopped stays
+        # False until this test reaps it itself.
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)  # noqa: SLF001 -- child leg of a test fork
+
+        try:
+            deadline = time.monotonic() + 5.0
+            state = None
+            while time.monotonic() < deadline:
+                with open(f"/proc/{pid}/stat", encoding="utf-8") as stat_file:
+                    state = stat_file.read().rsplit(")", 1)[1].strip().split()[0]
+                if state == "Z":
+                    break
+                time.sleep(0.005)
+            self.assertEqual(state, "Z", "child never reached zombie state")
+
+            process = FakeProcess(process_details={"pid": pid})
+            self.assertFalse(
+                LAUNCH_MODULE._process_stopped(process),
+                "a zombie must not be reported as stopped before it is reaped")
+        finally:
+            os.waitpid(pid, 0)
+
+        self.assertTrue(
+            LAUNCH_MODULE._process_stopped(process),
+            "a reaped child must be reported as stopped")
+
+    def test_unstarted_bridge_is_safe(self):
+        logger = RecordingLogger()
+        bridge = FakeProcess()
+
+        with patch.object(LAUNCH_MODULE.os, "kill") as kill:
+            LAUNCH_MODULE._stop_bridge_process(bridge, "image bridge", logger)
+
+        kill.assert_not_called()
+        self.assertTrue(any("not started" in message for message in logger.debug_messages))
+
+    def test_stopped_bridge_is_ignored(self):
+        logger = RecordingLogger()
+        bridge = FakeProcess(return_code=0, process_details={"pid": 123})
+
+        with patch.object(LAUNCH_MODULE.os, "kill") as kill:
+            LAUNCH_MODULE._stop_bridge_process(bridge, "image bridge", logger)
+
+        kill.assert_not_called()
+
+    def test_bridge_receives_sigint_and_is_awaited(self):
+        logger = RecordingLogger()
+        bridge = FakeProcess(process_details={"pid": 123})
+
+        with (
+            patch.object(
+                LAUNCH_MODULE,
+                "_process_stopped",
+                side_effect=(False, False, True),
+            ),
+            patch.object(LAUNCH_MODULE.os, "kill") as kill,
+            patch.object(
+                LAUNCH_MODULE.time,
+                "monotonic",
+                side_effect=(0.0, 0.0, 0.1),
+            ),
+            patch.object(LAUNCH_MODULE.time, "sleep"),
+        ):
+            LAUNCH_MODULE._stop_bridge_process(bridge, "image bridge", logger)
+
+        kill.assert_called_once_with(123, signal.SIGINT)
+        self.assertTrue(any("stopped before" in message for message in logger.info_messages))
+        self.assertEqual(logger.warning_messages, [])
+
+    def test_bridge_wait_is_bounded(self):
+        logger = RecordingLogger()
+        bridge = FakeProcess(process_details={"pid": 123})
+
+        with (
+            patch.object(LAUNCH_MODULE, "_process_stopped", return_value=False),
+            patch.object(LAUNCH_MODULE.os, "kill") as kill,
+            patch.object(LAUNCH_MODULE.time, "monotonic", return_value=1.0),
+        ):
+            LAUNCH_MODULE._stop_bridge_process(bridge, "image bridge", logger, timeout=0.0)
+
+        kill.assert_called_once_with(123, signal.SIGINT)
+        self.assertTrue(any("did not stop" in message for message in logger.warning_messages))
+
+    def test_kill_gazebo_server_sends_sigkill(self):
+        logger = RecordingLogger()
+        gazebo = FakeProcess(process_details={"pid": 456})
+
+        with (
+            patch.object(LAUNCH_MODULE, "_process_stopped", return_value=False),
+            patch.object(LAUNCH_MODULE.os, "kill") as kill,
+        ):
+            LAUNCH_MODULE._kill_gazebo_server(gazebo, logger)
+
+        kill.assert_called_once_with(456, signal.SIGKILL)
+
+    def test_kill_gazebo_server_skips_already_stopped(self):
+        logger = RecordingLogger()
+        gazebo = FakeProcess(return_code=0, process_details={"pid": 456})
+
+        with (
+            patch.object(LAUNCH_MODULE, "_process_stopped", return_value=True),
+            patch.object(LAUNCH_MODULE.os, "kill") as kill,
+        ):
+            LAUNCH_MODULE._kill_gazebo_server(gazebo, logger)
+
+        kill.assert_not_called()
+
+    def test_kill_gazebo_server_tolerates_already_reaped_pid(self):
+        logger = RecordingLogger()
+        gazebo = FakeProcess(process_details={"pid": 456})
+
+        with (
+            patch.object(LAUNCH_MODULE, "_process_stopped", return_value=False),
+            patch.object(
+                LAUNCH_MODULE.os, "kill", side_effect=ProcessLookupError,
+            ),
+        ):
+            LAUNCH_MODULE._kill_gazebo_server(gazebo, logger)
+
+        self.assertEqual(logger.warning_messages, [])
+
+    def test_process_wait_returns_after_process_stops(self):
+        process = FakeProcess(process_details={"pid": 123})
+
+        with (
+            patch.object(
+                LAUNCH_MODULE, "_process_stopped", side_effect=(False, True)),
+            patch.object(
+                LAUNCH_MODULE.time, "monotonic", side_effect=(5.0, 5.0)),
+            patch.object(LAUNCH_MODULE.time, "sleep") as sleep,
+        ):
+            stopped = LAUNCH_MODULE._wait_for_process_stop(process, timeout=1.0)
+
+        self.assertTrue(stopped)
+        sleep.assert_called_once_with(LAUNCH_MODULE.PROCESS_STOP_POLL_INTERVAL)
+
+    def test_process_wait_timeout_is_bounded(self):
+        process = FakeProcess(process_details={"pid": 123})
+
+        with (
+            patch.object(LAUNCH_MODULE, "_process_stopped", return_value=False),
+            patch.object(
+                LAUNCH_MODULE.time,
+                "monotonic",
+                side_effect=(5.0, 5.0, 5.2),
+            ),
+            patch.object(LAUNCH_MODULE.time, "sleep") as sleep,
+        ):
+            stopped = LAUNCH_MODULE._wait_for_process_stop(process, timeout=0.2)
+
+        self.assertFalse(stopped)
+        sleep.assert_called_once_with(LAUNCH_MODULE.PROCESS_STOP_POLL_INTERVAL)
+
+    def test_world_is_paused_before_bridges_and_gazebo_are_stopped(self):
+        # image_bridge crashes if a camera frame arrives while it shuts down
+        # (issue #55), so nothing may be sent to it before the world is paused.
+        calls = []
+        context = SimpleNamespace(environment={})
+        gazebo = FakeProcess(process_details={"pid": 456})
+        image_bridge = FakeProcess(process_details={"pid": 123})
+        parameter_bridge = FakeProcess(process_details={"pid": 124})
+
+        def record_bridge_stop(process, label, *args):
+            del process, args
+            calls.append(label)
+
+        def record_gazebo_service(command, **kwargs):
+            del kwargs
+            service = command[command.index("-s") + 1]
+            calls.append(
+                "pause" if service == "/world/empty_world/control"
+                else "stop" if service == "/server_control" else service)
+            return SimpleNamespace(
+                returncode=0, stdout="data: true", stderr="")
+
+        with (
+            patch.object(
+                LAUNCH_MODULE, "_stop_bridge_process",
+                side_effect=record_bridge_stop,
+            ),
+            patch.object(LAUNCH_MODULE.shutil, "which", return_value="/usr/bin/ign"),
+            patch.object(
+                LAUNCH_MODULE.subprocess, "run",
+                side_effect=record_gazebo_service,
+            ),
+            patch.object(LAUNCH_MODULE.time, "sleep") as sleep,
+            patch.object(
+                LAUNCH_MODULE, "_wait_for_process_stop", return_value=True,
+            ) as wait_for_stop,
+        ):
+            LAUNCH_MODULE._request_gazebo_stop(
+                None, context, gazebo, "empty_world", image_bridge,
+                parameter_bridge)
+
+        self.assertEqual(
+            calls, ["pause", "image bridge", "parameter bridge", "stop"])
+        sleep.assert_called_once_with(LAUNCH_MODULE.GAZEBO_PAUSE_SETTLE)
+        wait_for_stop.assert_called_once_with(
+            gazebo, LAUNCH_MODULE.GAZEBO_CLEAN_STOP_TIMEOUT)
+
+    def test_unknown_world_skips_the_pause_but_still_stops(self):
+        logger = RecordingLogger()
+        context = SimpleNamespace(environment={})
+        gazebo = FakeProcess(process_details={"pid": 456})
+
+        with (
+            patch.object(LAUNCH_MODULE, "_stop_bridge_process"),
+            patch.object(LAUNCH_MODULE.shutil, "which", return_value="/usr/bin/ign"),
+            patch.object(
+                LAUNCH_MODULE.subprocess, "run",
+                return_value=SimpleNamespace(
+                    returncode=0, stdout="data: true", stderr=""),
+            ) as run,
+            patch.object(
+                LAUNCH_MODULE, "_wait_for_process_stop", return_value=True),
+            patch.object(LAUNCH_MODULE, "get_logger", return_value=logger),
+        ):
+            LAUNCH_MODULE._request_gazebo_stop(
+                None, context, gazebo, None, FakeProcess(), FakeProcess())
+
+        run.assert_called_once()
+        self.assertIn("/server_control", run.call_args.args[0])
+        self.assertTrue(any(
+            "unknown world name" in message
+            for message in logger.warning_messages))
+        self.assertTrue(any(
+            "bridges with the world still running" in message
+            for message in logger.warning_messages))
+
+    def test_unacknowledged_pause_still_stops_the_bridges_and_gazebo(self):
+        calls = []
+        logger = RecordingLogger()
+        context = SimpleNamespace(environment={})
+        gazebo = FakeProcess(process_details={"pid": 456})
+
+        def fake_service(command, **kwargs):
+            del kwargs
+            service = command[command.index("-s") + 1]
+            calls.append(service)
+            acknowledged = service == "/server_control"
+            return SimpleNamespace(
+                returncode=0 if acknowledged else 1,
+                stdout="data: true" if acknowledged else "", stderr="timed out")
+
+        with (
+            patch.object(
+                LAUNCH_MODULE, "_stop_bridge_process",
+                side_effect=lambda process, label, *args: calls.append(label),
+            ),
+            patch.object(LAUNCH_MODULE.shutil, "which", return_value="/usr/bin/ign"),
+            patch.object(LAUNCH_MODULE.subprocess, "run", side_effect=fake_service),
+            patch.object(LAUNCH_MODULE.time, "sleep") as sleep,
+            patch.object(
+                LAUNCH_MODULE, "_wait_for_process_stop", return_value=True),
+            patch.object(LAUNCH_MODULE, "get_logger", return_value=logger),
+        ):
+            LAUNCH_MODULE._request_gazebo_stop(
+                None, context, gazebo, "empty_world", FakeProcess(), FakeProcess())
+
+        self.assertEqual(
+            calls,
+            ["/world/empty_world/control", "image bridge", "parameter bridge",
+             "/server_control"])
+        sleep.assert_not_called()
+        self.assertTrue(any(
+            "did not acknowledge the pause" in message
+            for message in logger.warning_messages))
+        self.assertTrue(any(
+            "bridges with the world still running" in message
+            for message in logger.warning_messages))
+
+    def test_world_name_is_read_from_the_sdf(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".world") as world:
+            world.write(
+                '<?xml version="1.0"?>\n'
+                '<sdf version="1.7"><world name="maze_6x5_v1"/></sdf>\n')
+            world.flush()
+            self.assertEqual(
+                LAUNCH_MODULE._world_name(world.name), "maze_6x5_v1")
+        self.assertIsNone(LAUNCH_MODULE._world_name("/nonexistent.world"))
+
+    def test_every_shipped_world_has_a_readable_name(self):
+        # A world that is not well-formed XML has no readable name, so the
+        # shutdown skips the pause for it.
+        worlds = sorted((LAUNCH_FILE.parents[1] / "worlds").glob("*.world"))
+        self.assertTrue(worlds, "no worlds found")
+        for world in worlds:
+            with self.subTest(world=world.name):
+                self.assertTrue(LAUNCH_MODULE._world_name(str(world)))
+
+    def test_gazebo_clean_stop_grace_is_bounded_and_force_killed(self):
+        logger = RecordingLogger()
+        context = SimpleNamespace(environment={})
+        gazebo = FakeProcess(process_details={"pid": 456})
+        image_bridge = FakeProcess(process_details={"pid": 123})
+        parameter_bridge = FakeProcess(process_details={"pid": 124})
+
+        with (
+            patch.object(LAUNCH_MODULE, "_stop_bridge_process"),
+            patch.object(LAUNCH_MODULE.shutil, "which", return_value="/usr/bin/ign"),
+            patch.object(
+                LAUNCH_MODULE.subprocess,
+                "run",
+                return_value=SimpleNamespace(
+                    returncode=0, stdout="data: true", stderr=""),
+            ),
+            patch.object(
+                LAUNCH_MODULE, "_wait_for_process_stop", return_value=False,
+            ) as wait_for_stop,
+            patch.object(LAUNCH_MODULE.time, "sleep"),
+            patch.object(LAUNCH_MODULE, "_kill_gazebo_server") as kill_gazebo,
+            patch.object(LAUNCH_MODULE, "get_logger", return_value=logger),
+        ):
+            LAUNCH_MODULE._request_gazebo_stop(
+                None, context, gazebo, "empty_world", image_bridge,
+                parameter_bridge)
+
+        wait_for_stop.assert_called_once_with(
+            gazebo, LAUNCH_MODULE.GAZEBO_CLEAN_STOP_TIMEOUT)
+        kill_gazebo.assert_called_once_with(gazebo, logger)
+        self.assertTrue(any(
+            f"within {LAUNCH_MODULE.GAZEBO_CLEAN_STOP_TIMEOUT:.0f} seconds"
+            in message
+            for message in logger.warning_messages
+        ))
+
+
+class TestSpawnStartup(unittest.TestCase):
+    """Pin how the nodes that need the robot follow its spawn."""
+
+    def test_actions_launch_after_a_successful_spawn(self):
+        actions = [object(), object()]
+
+        with patch.object(LAUNCH_MODULE, "get_logger") as get_logger:
+            launched = LAUNCH_MODULE._after_spawn_actions(
+                SimpleNamespace(returncode=0), actions)
+
+        self.assertIs(launched, actions)
+        get_logger.assert_not_called()
+
+    def test_failed_spawn_warns_but_still_launches_the_actions(self):
+        logger = RecordingLogger()
+        actions = [object()]
+
+        with patch.object(LAUNCH_MODULE, "get_logger", return_value=logger):
+            launched = LAUNCH_MODULE._after_spawn_actions(
+                SimpleNamespace(returncode=1), actions)
+
+        self.assertIs(launched, actions)
+        self.assertEqual(len(logger.warning_messages), 1)
+        self.assertIn("code 1", logger.warning_messages[0])
+
+    def test_probes_start_after_the_bridges(self):
+        # The probe start times are margins over the launch's own start times,
+        # so they must move with them.
+        self.assertGreater(
+            sim_timing.PROBE_START_DELAY, LAUNCH_MODULE.BRIDGE_START_DELAY)
+        self.assertGreater(
+            sim_timing.PERFORMANCE_PROBE_START_DELAY, sim_timing.PROBE_START_DELAY)
+
+
+class FakeExitedProcess:
+    """Stand in for a launch ProcessExited event in the exit-code contract."""
+
+    def __init__(self, process_name, returncode):
+        self.process_name = process_name
+        self.returncode = returncode
+
+
+class TestShutdownExitCodeContract(unittest.TestCase):
+    """Pin which exit codes each simulator process is allowed to report."""
+
+    def test_clean_exits_are_accepted(self):
+        shutdown_asserts.assert_clean_shutdown([
+            FakeExitedProcess("ruby-1", 0),
+            FakeExitedProcess("parameter_bridge-3", 0),
+        ])
+
+    def test_force_killed_gazebo_is_accepted(self):
+        # _kill_gazebo_server escalates to SIGKILL when the clean stop stalls,
+        # so -9 on the server is the designed outcome, not a failure.
+        shutdown_asserts.assert_clean_shutdown([
+            FakeExitedProcess("ruby-1", -9),
+            FakeExitedProcess("parameter_bridge-3", 0),
+        ])
+
+    def test_gazebo_segfault_still_fails(self):
+        with self.assertRaises(AssertionError):
+            shutdown_asserts.assert_clean_shutdown([
+                FakeExitedProcess("ruby-1", -11)])
+
+    def test_force_kill_is_not_tolerated_for_other_processes(self):
+        with self.assertRaises(AssertionError):
+            shutdown_asserts.assert_clean_shutdown([
+                FakeExitedProcess("ruby-1", 0),
+                FakeExitedProcess("parameter_bridge-3", -9)])
+
+    def test_signal_escalation_on_a_bridge_still_fails(self):
+        with self.assertRaises(AssertionError):
+            shutdown_asserts.assert_clean_shutdown([
+                FakeExitedProcess("image_bridge-4", -2)])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Run the representative headless simulator contract gate.
+
+set -eo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# A normal ROS checkout lives at <workspace>/src/yahboom_rosmaster.  CI checks
+# the repository out directly and uses the repository root as its workspace.
+if [[ "$(basename "$(dirname "${REPO_DIR}")")" == "src" ]]; then
+    WORKSPACE_DIR="$(cd "${REPO_DIR}/../.." && pwd)"
+else
+    WORKSPACE_DIR="${REPO_DIR}"
+fi
+
+# The ament linters take seconds; running them here keeps lint regressions from
+# reaching main unnoticed.
+CONTRACT_REGEX='^(flake8|pep257|xmllint|lint_cmake|robot_description_contract|motion_profile_contract|launch_argument_consistency|python_node_clock_contract|practice_world_probe_contract|map_assets_contract|map_server_smoke|launch_shutdown_contract|sensor_contract_probe_contract|sensor_profiles_contract|sensor_qos_relay_contract|imu_raw_relay_contract|imu_filter_config_contract|cloud_timing_contract|cloud_timing_probe_contract|camera_adapter_contract|depth_quality_contract|measurement_tools_contract|physical_probe_pin_contract|real_robot_contract|installed_paths_contract|classic_launch_contract|command_limits_contract|wheel_state_odometry_contract|sensor_contract_ci|base_feedback|ground_truth_contract|spawn_pose_contract|ground_truth_alignment_math|ground_truth_display|ground_truth_odom_mode|ground_truth_map_mode|motion_profile_(divergence_ideal|yaw_ideal)|wheel_odometry_resilience)$'
+
+if [[ -r /opt/ros/humble/setup.bash ]]; then
+    # Workflow steps start in a fresh shell even though ROS_DISTRO is exported.
+    # shellcheck disable=SC1091
+    source /opt/ros/humble/setup.bash
+elif [[ -z "${ROS_DISTRO:-}" ]]; then
+    echo "ROS 2 is not sourced and /opt/ros/humble/setup.bash is unavailable." >&2
+    exit 2
+fi
+
+if [[ "${ROS_DISTRO}" != "humble" ]]; then
+    echo "The simulator contract gate requires ROS 2 Humble (found '${ROS_DISTRO}')." >&2
+    exit 2
+fi
+
+if [[ ! -r "${WORKSPACE_DIR}/install/setup.bash" ]]; then
+    echo "Missing ${WORKSPACE_DIR}/install/setup.bash; build the workspace first." >&2
+    exit 2
+fi
+
+# shellcheck disable=SC1090
+source "${WORKSPACE_DIR}/install/setup.bash"
+cd "${WORKSPACE_DIR}"
+
+echo "Running representative simulator contracts from ${WORKSPACE_DIR}"
+echo "CTest selection: ${CONTRACT_REGEX}"
+
+test_status=0
+colcon test \
+    --packages-select yahboom_rosmaster_description yahboom_rosmaster_gazebo \
+    --executor sequential \
+    --return-code-on-test-failure \
+    --event-handlers console_direct+ \
+    --ctest-args -R "${CONTRACT_REGEX}" --output-on-failure \
+    || test_status=$?
+
+result_status=0
+colcon test-result --verbose --all || result_status=$?
+
+if ((test_status != 0)); then
+    exit "${test_status}"
+fi
+exit "${result_status}"

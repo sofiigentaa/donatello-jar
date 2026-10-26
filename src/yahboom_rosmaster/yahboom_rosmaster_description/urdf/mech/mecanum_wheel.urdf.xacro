@@ -1,0 +1,131 @@
+<?xml version="1.0"?>
+<!--
+  Mecanum wheel with sphere collision + fdir1 anisotropic friction.
+
+  Each wheel is a sphere (single contact point) with profile-selected contact
+  values. The ideal profile uses mu=1.0 along fdir1 and mu2=0.0 perpendicular
+  to fdir1; the default stress profile adds deterministic compliance, roller
+  resistance, and per-wheel asymmetry.
+
+  fdir1 is expressed in the robot base_footprint frame via ignition:expressed_in
+  to match the native Gazebo mecanum demo's chassis-frame friction directions.
+  Locomotion is commanded by the Gazebo MecanumDrive system; this collision and
+  friction model remains the wheel-ground contact model that DART resolves.
+
+  fdir1 values per wheel (set by caller in rosmaster_x3.urdf.xacro):
+    FL, BR: "1 -1 0"
+    FR, BL: "1  1 0"
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro"
+       xmlns:ignition="http://ignitionrobotics.org/schema">
+
+  <xacro:property name="wheel_radius"    value="0.0325"  />
+  <xacro:property name="wheel_separation" value="0.169"  />
+  <xacro:property name="wheel_width"     value="0.03040" />
+  <xacro:property name="wheel_mass"      value="0.05"    />
+  <xacro:property name="wheel_xoff"      value="0.08"    />
+  <!-- Wheel axles sit this far below base_link on the physical X3 (measured on
+       x3-c; physical_rosmaster yahboomcar_X3.urdf.xacro front_wheel_drop), so
+       base_link is 71.4 mm above the floor. The measured rear axles are within
+       0.6 mm of this; one value keeps the four contacts level. -->
+  <xacro:property name="wheel_axle_drop" value="0.0389"  />
+
+  <xacro:macro name="mecanum_wheel" params="
+    prefix
+    side
+    x_reflect
+    y_reflect
+    fdir1:='1 0 0'
+    mu:=1.0
+    mu2:=0.0
+    slip1:=0.0
+    slip2:=0.0
+    simple_friction:=false
+    joint_type:=continuous">
+    <link name="${prefix}${side}_wheel_link">
+      <visual>
+        <!-- The generated mesh is link-local; no additional visual offset is
+             needed once the joint uses the measured lateral wheel centre. -->
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="file://$(find yahboom_rosmaster_description)/meshes/rosmaster_x3/cad_visual/${side}_wheel.obj"/>
+        </geometry>
+      </visual>
+
+      <!-- Sphere gives a single contact point. Required for ignition:expressed_in
+           to correctly lock fdir1 to the chassis frame (cylinder gives an extended
+           contact line which behaves unpredictably with directional friction). -->
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <sphere radius="${wheel_radius}"/>
+        </geometry>
+      </collision>
+
+      <inertial>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <mass value="${wheel_mass}"/>
+        <xacro:property name="I_sphere" value="${(2.0/5.0) * wheel_mass * wheel_radius * wheel_radius}"/>
+        <inertia ixx="${I_sphere}" ixy="0" ixz="0"
+                 iyy="${I_sphere}" iyz="0"
+                 izz="${I_sphere}"/>
+      </inertial>
+    </link>
+
+    <!-- Gazebo Classic drives the base with planar_move, which forces an
+         angular velocity onto every link. A revolute wheel must be free to
+         spin about its own axis, so that command contradicts the joint and
+         the ODE solver diverges to NaN, leaving the robot immobile. Welding
+         the wheels makes the base a single rigid body and planar_move works.
+         Fortress keeps them continuous: MecanumDrive spins them properly. -->
+    <joint name="${prefix}${side}_wheel_joint" type="${joint_type}">
+      <axis xyz="0 1 0"/>
+      <parent link="${prefix}base_link"/>
+      <child  link="${prefix}${side}_wheel_link"/>
+      <origin xyz="${x_reflect*wheel_xoff} ${y_reflect*wheel_separation/2} ${-wheel_axle_drop}"
+              rpy="0 0 0"/>
+      <dynamics damping="0.1" friction="0.0"/>
+    </joint>
+
+    <gazebo reference="${prefix}${side}_wheel_link">
+      <collision>
+        <surface>
+          <friction>
+            <ode>
+              <xacro:unless value="${simple_friction}">
+                <!-- High friction along fdir1 (roller grip axis) -->
+                <mu>${mu}</mu>
+                <!-- Zero friction perpendicular (roller free-rolling direction) -->
+                <mu2>${mu2}</mu2>
+                <!-- ignition:expressed_in locks fdir1 to the chassis frame.
+                     base_footprint is the model root frame, equivalent to "chassis"
+                     in the official Gazebo mecanum demo. -->
+                <fdir1 ignition:expressed_in="${prefix}base_footprint">${fdir1}</fdir1>
+                <slip1>${slip1}</slip1>
+                <slip2>${slip2}</slip2>
+              </xacro:unless>
+              <!-- Gazebo Classic. The roller model above pairs mu2=0 with a
+                   directional fdir1, which leaves ODE a degenerate friction
+                   pyramid: the moment planar_move drives the body, the solver
+                   returns NaN velocities and the robot never moves. Classic gets
+                   plain low isotropic friction instead; planar_move imposes the
+                   body velocity directly, so it does not rely on wheel grip. -->
+              <xacro:if value="${simple_friction}">
+                <mu>0.1</mu>
+                <mu2>0.1</mu2>
+              </xacro:if>
+            </ode>
+          </friction>
+          <contact>
+            <ode>
+              <kp>200000.0</kp>
+              <kd>2000.0</kd>
+              <min_depth>0.001</min_depth>
+            </ode>
+          </contact>
+        </surface>
+      </collision>
+    </gazebo>
+  </xacro:macro>
+
+</robot>

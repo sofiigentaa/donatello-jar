@@ -1,0 +1,174 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:property name="M_PI" value="3.1415926535897931" />
+
+  <xacro:macro name="lidar_sensor" params="
+    prefix:=''
+    parent:='base_link'
+    frame_id:='laser_link'
+    mesh_file:='file://$(find yahboom_rosmaster_description)/meshes/rosmaster_x3/cad_visual/lidar.obj'
+    xyz_offset:='0.043 0 0.110'
+    rpy_offset:='0 0 ${M_PI}'
+    mesh_xyz_offset:='0 0 0'
+    mesh_rpy_offset:='0 0 0'
+    mesh_scale:='1 1 1'
+    collision_xyz_offset:='0 0 0'
+    collision_rpy_offset:='0 0 0'
+    inertial_xyz_offset:='0 0 0'
+    inertial_rpy_offset:='0 0 0'
+    lidar_width:=0.077
+    lidar_height:=0.0398
+    mass:=0.185
+    update_rate:=10
+    ray_count:=1080
+    min_angle:='-3.14159'
+    max_angle:='3.14159'
+    min_range:='0.05'
+    max_range:='12.0'
+    range_resolution:='0.013'
+    noise_mean:='0.0'
+    noise_stddev:='0.005'
+    topic_name:='scan'
+    always_on:=true
+    visualize:=false
+    enable_collision:=false
+    enable_gz_sensor:=true
+    classic_sensor:=false
+    plugin_ext:=.so">
+
+    <xacro:property name="radius" value="${lidar_width/2}" />
+    <xacro:property name="ixx_iyy" value="${(mass/12) * (3 * radius * radius + lidar_height * lidar_height)}" />
+    <xacro:property name="izz" value="${(mass/2) * (radius * radius)}" />
+
+    <link name="${prefix}${frame_id}">
+      <visual>
+        <origin xyz="${mesh_xyz_offset}" rpy="${mesh_rpy_offset}"/>
+        <geometry>
+          <mesh filename="${mesh_file}" scale="${mesh_scale}"/>
+        </geometry>
+      </visual>
+
+      <xacro:if value="${enable_collision}">
+        <collision>
+          <origin xyz="${collision_xyz_offset}" rpy="${collision_rpy_offset}"/>
+          <geometry>
+            <cylinder radius="${lidar_width/2}" length="${lidar_height}"/>
+          </geometry>
+        </collision>
+      </xacro:if>
+
+      <inertial>
+        <mass value="${mass}" />
+        <origin xyz="${inertial_xyz_offset}" rpy="${inertial_rpy_offset}"/>
+        <inertia
+          ixx="${ixx_iyy}"
+          ixy="0.0"
+          ixz="0.0"
+          iyy="${ixx_iyy}"
+          iyz="0.0"
+          izz="${izz}" />
+      </inertial>
+    </link>
+
+    <joint name="${prefix}${frame_id}_joint" type="fixed">
+      <parent link="${prefix}${parent}"/>
+      <child link="${prefix}${frame_id}" />
+      <origin xyz="${xyz_offset}" rpy="${rpy_offset}"/>
+    </joint>
+
+    <gazebo reference="${prefix}${frame_id}">
+      <!-- The detailed CAD housing encloses the GPU ray origin. Give only this
+           visual a private render bit so the LiDAR can ignore its own shell
+           without hiding the chassis, wheels, or camera from sensors. -->
+      <visual>
+        <visibility_flags>1</visibility_flags>
+      </visual>
+      <!-- Fortress-native GPU LiDAR. type="ray" (CPU LIDAR) is not supported in Fortress;
+           type="gpu_lidar" uses the ogre2 render pipeline (enabled in empty.world).
+           libgazebo_ros_ray_sensor.so is Classic-only and must not be used here.
+           Data flows via ros_gz_bridge (gz.msgs.LaserScan → sensor_msgs/LaserScan). -->
+      <!-- gpu_lidar drives the ogre2 render pipeline, which cannot initialise in
+           the Gazebo server's render thread on macOS (NSWindow is main-thread
+           only). Set enable_gz_sensor to false there to keep the link and TF
+           while leaving the rendering sensor out. -->
+      <xacro:if value="${enable_gz_sensor}">
+      <sensor name="${prefix}lidar_sensor" type="gpu_lidar">
+        <update_rate>${update_rate}</update_rate>
+        <always_on>${always_on}</always_on>
+        <visualize>${visualize}</visualize>
+        <!-- Short topic name so ros_gz_bridge.yaml 'scan' entry matches -->
+        <topic>${topic_name}</topic>
+        <gz_frame_id>${prefix}${frame_id}</gz_frame_id>
+        <lidar>
+          <visibility_mask>4294967294</visibility_mask>
+          <scan>
+            <horizontal>
+              <samples>${ray_count}</samples>
+              <resolution>1</resolution>
+              <min_angle>${min_angle}</min_angle>
+              <max_angle>${max_angle}</max_angle>
+            </horizontal>
+            <vertical>
+              <samples>1</samples>
+              <resolution>1</resolution>
+              <min_angle>0</min_angle>
+              <max_angle>0</max_angle>
+            </vertical>
+          </scan>
+          <range>
+            <min>${min_range}</min>
+            <max>${max_range}</max>
+            <resolution>${range_resolution}</resolution>
+          </range>
+          <!-- SDFormat's lidar schema uses a child element for the noise type. -->
+          <noise>
+            <type>gaussian</type>
+            <mean>${noise_mean}</mean>
+            <stddev>${noise_stddev}</stddev>
+          </noise>
+        </lidar>
+      </sensor>
+      </xacro:if>
+
+      <!-- Gazebo Classic. type="ray" is the CPU raycast lidar: it queries the
+           physics engine instead of the render pipeline, so unlike gpu_lidar it
+           produces correct ranges on macOS, where server-side rendering is
+           broken. -->
+      <xacro:if value="${classic_sensor}">
+        <sensor name="${prefix}lidar_sensor" type="ray">
+          <pose>0 0 0 0 0 0</pose>
+          <always_on>${always_on}</always_on>
+          <visualize>${visualize}</visualize>
+          <update_rate>${update_rate}</update_rate>
+          <ray>
+            <scan>
+              <horizontal>
+                <samples>${ray_count}</samples>
+                <resolution>1</resolution>
+                <min_angle>${min_angle}</min_angle>
+                <max_angle>${max_angle}</max_angle>
+              </horizontal>
+            </scan>
+            <range>
+              <min>${min_range}</min>
+              <max>${max_range}</max>
+              <resolution>${range_resolution}</resolution>
+            </range>
+            <noise>
+              <type>gaussian</type>
+              <mean>${noise_mean}</mean>
+              <stddev>${noise_stddev}</stddev>
+            </noise>
+          </ray>
+          <plugin name="${prefix}lidar_controller" filename="libgazebo_ros_ray_sensor${plugin_ext}">
+            <ros>
+              <remapping>~/out:=${topic_name}</remapping>
+            </ros>
+            <output_type>sensor_msgs/LaserScan</output_type>
+            <frame_name>${prefix}${frame_id}</frame_name>
+          </plugin>
+        </sensor>
+      </xacro:if>
+    </gazebo>
+  </xacro:macro>
+</robot>

@@ -1,0 +1,1531 @@
+# Simulator <-> physical ROSMASTER X3 parity ledger.
+#
+# Three sections:
+#
+#   physical          What the physical X3 delivers, read from physical_rosmaster
+#                     (see physical.provenance). This is the reference.
+#   simulator         What the simulator delivers today, as parity entries that
+#                     mirror the physical keys. The contract probes read their
+#                     expected values from here, so moving the simulator to the
+#                     physical value means editing an entry here and the model
+#                     together (yahboom_rosmaster#43, steps 4-9).
+#   legacy_bag_audit  The 2026-07-26 bag-derived contract this file replaced.
+#                     Kept only where nothing newer measures the same thing;
+#                     superseded values say what replaced them.
+#
+# `confidence` legend for the physical and legacy sections:
+#   measured      - observed on the robot's topics or TF by a reproducible tool:
+#                   physical_rosmaster tools/sensor_capability_probe.py,
+#                   tools/depth_wall_calibration.py, or (legacy section)
+#                   scripts/real_robot_bag_analyzer.py.
+#   manual_audit  - a hand measurement or manual audit that no tool reproduces
+#                   (tape measure; the 2026-07-26 bag audit).
+#   inferred      - read from physical_rosmaster source or configuration: what
+#                   the robot is configured to publish, not observed on the wire.
+#   absent        - no data exists.
+#
+# A simulator parity entry is a mapping with:
+#   nominal           value configured on main (xacro, bridge, controller or
+#                     node configuration).
+#   measured          value observed on main with the physical probe (step 2),
+#                     or by a later step listed in step_measurements under
+#                     simulator.provenance.
+#   contract          [min, max] graded by the simulator's probes (rates only).
+#   matches_physical  true or false. real_robot_contract_test.py checks it
+#                     against the physical value at the same key whenever both
+#                     are comparable: numbers must be equal or within the
+#                     entry's absolute `tolerance`, strings and booleans equal,
+#                     lists and mappings element by element.
+#   closes_in_step    the yahboom_rosmaster#43 step that closes the gap, or
+#                     out_of_scope (with a note) when #43 does not plan to.
+#   tolerance, note   optional.
+#
+# A physical value that is a measured range is written {min: low, max: high}.
+# values_agree() accepts a simulator number inside it, widened by the entry's
+# `tolerance`, so "the simulator's scale error lies in the physical range" is
+# verified rather than assumed. A bare [low, high] list is not a range: lists
+# compare element by element, and a simulator number against one is not
+# comparable.
+#
+# simulator.render_settings is the one group of the simulator section that is
+# not made of parity entries. It holds what the simulator is configured with
+# that has no physical counterpart (the camera's clip planes), each as
+# {nominal, note}. The description contract and depth_geometry_probe read it
+# through RealRobotContract.setting(), and real_robot_contract_test validates
+# it: a setting must be a positive number, must not be a parity entry, and must
+# not share a name with a physical key (which would make it a parity entry).
+#
+# See yahboom_rosmaster_gazebo/doc/real_robot_contract.md for how to refresh
+# each section.
+
+version: 2
+
+physical:
+  provenance:
+    repository: https://github.com/AIRclub-UdeSA/physical_rosmaster
+    commit: fa56a87beb186fab7545e650265eb43792acf827
+    read_on: "2026-10-03"
+    # #43 step 9 re-pinned to fa56a87, the merge commit of physical_rosmaster#47
+    # (the contract probe's `target` parameter), from 468662c. This pin is also
+    # the commit CI fetches tools/physical_contract_probe.py at. Between the two,
+    # `git diff --stat 468662c..fa56a87` over every path in `sources` below shows
+    # one file, config/robot_contract.yaml, whose only change is /imu/data_raw
+    # leaving hardware_extensions, which this file already did in step 8c. The
+    # rest of the range is the probe, its tests, the README and
+    # tools/sensor_capability_probe.py (not a source here). So no value below
+    # moved, and every measured simulator figure still compares with the same
+    # physical numbers.
+    # physical_rosmaster main after #44 and #45 merged (this is #45's merge
+    # commit). Every physical value below was re-read at it on 2026-09-29, for
+    # #43 step 7. Since bff09c7, the head of #45 that this file pinned until
+    # then, only docs/sensor_capabilities.md and the probe tools changed; the
+    # files and artifacts this ledger names are otherwise identical, and so are
+    # the 2026-09-24 artifacts. What #45 gained in b76b2b5 is reflected in the
+    # comments below: the boot claim is scoped to one warm reboot's 25-65 s
+    # window, and the driver produces a cloud for "at least 36%" of frames.
+    # No value below changed. The measurement of the point cloud was taken at
+    # b144d31 (docs/sensor_capabilities.md "Measurement record").
+    robot: x3-c (host yahboom), Astra serial ACRC64300ET, pinned Orbbec driver f7e71d9
+    deployed_commit_during_measurements: 01e1a60
+    sources:
+      - docs/sensor_capabilities.md
+      - docs/depth_camera_calibration.md
+      - config/robot_contract.yaml
+      - tools/physical_contract_probe.py
+      - robot_artifacts/x3c_sensor_capability_2026-09-17/camera_public.json
+      - robot_artifacts/x3c_sensor_capability_2026-09-17/camera_hardware.json
+      - robot_artifacts/x3c_sensor_capability_2026-09-17/cloud_paired.json
+      - robot_artifacts/x3c_sensor_capability_2026-09-17/sensors_stationary.json
+      - robot_artifacts/x3c_sensor_capability_2026-09-17/post_deploy_tf.json
+      - robot_artifacts/x3c_sensor_capability_2026-09-24/camera_settled_1.json
+      - robot_artifacts/x3c_sensor_capability_2026-09-24/camera_settled_2.json
+      - robot_artifacts/x3c_sensor_capability_2026-09-24/camera_settled_3.json
+      - yahboomcar_description/urdf/yahboomcar_X3.urdf.xacro
+      - yahboomcar_bringup/param/x3_driver.yaml
+      - yahboomcar_bringup/param/x3_odometry.yaml
+      - yahboomcar_bringup/param/imu_filter_param.yaml
+      - yahboomcar_bringup/yahboomcar_bringup/Mcnamu_driver_X3.py
+      - yahboomcar_bringup/launch/yahboomcar_bringup_X3_launch.py
+      - yahboomcar_astra/launch/astra_platform.launch.py
+      - yahboomcar_astra/yahboomcar_astra/sensor_adapter.py
+      - sllidar_ros2/src/sllidar_node.cpp
+
+  frames:
+    confidence: measured
+    source: >
+      yahboomcar_X3.urdf.xacro, confirmed by live TF in
+      post_deploy_tf.json (docs/sensor_capabilities.md "Sensor mounts").
+      Frames below cam_1_link come from the Orbbec driver's factory
+      calibration, not the xacro.
+    base_footprint_to_base_link_z_m: 0.0714
+    base_footprint_note: >
+      front_wheel_drop (0.0389, measured on x3-c) + wheel_radius (0.0325),
+      physical_rosmaster PR #31. sensors_stationary.json still shows 0.0815
+      in its TF block because it predates that deploy; post_deploy_tf.json,
+      taken after it, shows 0.0714.
+    # Poses relative to base_link: xyz in metres, rpy in radians.
+    mounts:
+      cam_1_link: {xyz: [0.057105, 0.000017948, 0.03755], rpy: [0.0, 0.0, 0.0]}
+      cam_1_depth_frame: {xyz: [0.057105, 0.000017948, 0.03755], rpy: [0.0, 0.0, 0.0]}
+      cam_1_color_frame: {xyz: [0.054937, 0.025094, 0.037410], rpy: [-0.000336, 0.004697, 0.003574]}
+      laser_link: {xyz: [0.0435, 0.0000526, 0.11], rpy: [0.0, 0.0, 3.141592653589793]}
+      imu_link: {xyz: [-0.06, 0.01, 0.01], rpy: [0.0, 3.141592653589793, 1.5707963267948966]}
+    camera_frames:
+      - cam_1_link
+      - cam_1_depth_frame
+      - cam_1_depth_optical_frame
+      - cam_1_color_frame
+      - cam_1_color_optical_frame
+    tape_check:
+      confidence: manual_audit
+      source: docs/sensor_capabilities.md "Physical confirmation" (2026-09-17)
+      camera_height_above_floor_m: [0.105, 0.109]
+      camera_setback_from_chassis_front_m: 0.040
+      note: >
+        About +/-2 mm. The xacro predicts 0.10895 m, which confirms the
+        0.0714 m base_link height. The camera setback shows camera_link.STL
+        and camera_mount_joint are right and physical_rosmaster's copy of
+        cad_visual/camera.obj is drawn 58.9 mm too far back
+        (physical_rosmaster#33).
+
+  wheels:
+    confidence: inferred
+    source: yahboomcar_X3.urdf.xacro, yahboomcar_bringup/param/x3_odometry.yaml, x3_driver.yaml
+    radius_m: 0.0325
+    radius_note: 65 mm diameter from the Yahboom X3 specification, not measured.
+    # Axle positions relative to base_link. The front axle drop (0.0389) was
+    # measured on x3-c; the rest comes from the CAD-derived xacro.
+    origins:
+      front_left: [0.08, 0.084492, -0.0389]
+      front_right: [0.08, -0.0845, -0.0389]
+      back_left: [-0.08, 0.084492, -0.03954]
+      back_right: [-0.08, -0.0845, -0.03946]
+    odometry_wheelbase_m: 0.160
+    odometry_track_width_m: 0.170
+    encoder_counts_per_revolution: 1040.0
+
+  topics:
+    confidence: measured
+    source: >
+      docs/sensor_capabilities.md "Rates and latency";
+      camera_public.json and sensors_stationary.json (2026-09-17,
+      stationary, one probe subscriber). The point cloud is the exception: it
+      is the 2026-09-24 re-measurement of the shipped pipeline, docs/
+      sensor_capabilities.md "Point cloud" and camera_settled_1..3.json.
+    note: >
+      rate_hz and period_p95_ms are wall clock. latency_ms is receive time
+      minus header.stamp, measured on the robot. reliability is read from the
+      publishers' source (sensor_adapter.py qos_profile_sensor_data,
+      sllidar_node.cpp SensorDataQoS), except /odom, whose publisher QoS the
+      probe recorded in post_deploy_tf.json.
+    /cam_1/color/image_raw:
+      type: sensor_msgs/msg/Image
+      frame_id: cam_1_color_optical_frame
+      encoding: rgb8
+      rate_hz: 30.01
+      period_p95_ms: 36.4
+      latency_ms: 5.5
+      reliability: best_effort
+    /cam_1/color/camera_info:
+      type: sensor_msgs/msg/CameraInfo
+      frame_id: cam_1_color_optical_frame
+      rate_hz: 29.97
+      period_p95_ms: 36.6
+      latency_ms: 6.2
+      reliability: best_effort
+    /cam_1/depth/image_raw:
+      type: sensor_msgs/msg/Image
+      frame_id: cam_1_color_optical_frame
+      encoding: 32FC1
+      rate_hz: 30.00
+      period_p95_ms: 39.2
+      latency_ms: 2.2
+      reliability: best_effort
+    /cam_1/depth/camera_info:
+      type: sensor_msgs/msg/CameraInfo
+      frame_id: cam_1_color_optical_frame
+      rate_hz: 30.01
+      period_p95_ms: 38.9
+      latency_ms: 2.9
+      reliability: best_effort
+    /cam_1/depth/color/points:
+      type: sensor_msgs/msg/PointCloud2
+      frame_id: cam_1_depth_frame
+      # Measured 2026-09-24 on x3-c on the shipped pipeline (16-byte points,
+      # cloud_strip_nan true, cloud_decimation 1), robot stationary, one probe
+      # subscriber, three settled 40 s runs pooled: 988 stamp gaps. It replaces
+      # the provisional 2026-09-17 figures (32-byte organized points, four
+      # windows), which the pipeline has since outgrown.
+      # The compared values are scalars. The rate is the mean, 30.0 Hz over the
+      # mean gap of 3.63 frames: 8.3 Hz with 27.6% of camera frames delivered.
+      rate_hz: 8.26
+      period_p95_ms: 367
+      latency_ms: 50
+      # Every gap was a whole number of 33.3 ms frames (0 of 2747 off the grid)
+      # and consecutive gaps were uncorrelated, so a simulator can draw each
+      # independently from the distribution in sensor_profiles.yaml.
+      gap_frames: {median: 2, p95: 11, longest: 34, mean: 3.63}
+      worst_gap_s: 1.13
+      # Descriptive: how the settled runs spread, which no simulator value is
+      # compared with. Five settled runs gave 7.3-9.2 Hz with nothing changed
+      # between them, and run medians of 43-53 ms with a per-run standard
+      # deviation of 1-3 ms. The one boot capture, a warm reboot begun 25 s
+      # after the platform came up (so its 25-65 s window, not the ready gate's
+      # first five clouds), ran at 9.56 Hz, not slower than the settled runs.
+      # It does not cover a cold boot, a separate failure mode.
+      rate_hz_settled_range: [7.3, 9.2]
+      latency_ms_run_medians: [43, 53]
+      reliability: best_effort
+    /scan:
+      type: sensor_msgs/msg/LaserScan
+      frame_id: laser_link
+      rate_hz: 7.17
+      period_p95_ms: 148.8
+      # One full scan period by construction: stamped at scan start, published
+      # after the revolution completes.
+      latency_ms: 135.7
+      reliability: best_effort
+    /imu/data:
+      type: sensor_msgs/msg/Imu
+      frame_id: imu_link
+      rate_hz: 10.00
+      period_p95_ms: 102.1
+      latency_ms: 3.0
+    /imu/data_raw:
+      type: sensor_msgs/msg/Imu
+      frame_id: imu_link
+      rate_hz: 10.00
+      period_p95_ms: 102.2
+      latency_ms: 2.5
+      reliability: reliable
+      # sensors_stationary.json: one publisher, driver_node, Reliable. The driver
+      # fills only the header, acceleration and angular velocity of the message
+      # and publishes it with depth 100 (Mcnamu_driver_X3.py publish_data).
+      orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+      covariances: all_zero
+    /odom:
+      type: nav_msgs/msg/Odometry
+      frame_id: odom
+      child_frame_id: base_footprint
+      rate_hz: 10.00
+      period_p95_ms: 102.6
+      latency_ms: 3.1
+      reliability: reliable
+    /joint_states:
+      type: sensor_msgs/msg/JointState
+      # Read from the driver, not observed: Mcnamu_driver_X3.py:508 sets
+      # state.header.frame_id = "joint_states", and the physical contract probe
+      # requires a non-empty frame_id on every message. The capture JSON does not
+      # record header frames.
+      frame_id: joint_states
+      rate_hz: 10.00
+      period_p95_ms: 101.9
+      latency_ms: 1.6
+
+  camera:
+    confidence: measured
+    source: docs/sensor_capabilities.md "Camera"; camera_public.json and camera_hardware.json
+    note: >
+      Depth is registered to color, so the depth image and both camera_info
+      topics carry cam_1_color_optical_frame and the color intrinsics. The
+      driver runs both streams at 320x240 (astra_platform.launch.py).
+    width: 320
+    height: 240
+    fx: 271.809
+    fy: 271.809
+    cx: 158.719
+    cy: 120.092
+    # Derived from fx and the width: 60.97 deg horizontal, 47.64 deg vertical.
+    horizontal_fov_rad: 1.06406
+    distortion_model: plumb_bob
+    distortion_coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+  depth:
+    confidence: measured
+    source: >
+      docs/depth_camera_calibration.md (wall fits, 2026-09-18) and
+      camera_public.json (2026-09-17)
+    # The doc records -1.1% to -1.3% and recommends correcting with
+    # true ~= reported * 1.012 ("Scale"); the simulator applies that inverse.
+    scale_error: {min: -0.013, max: -0.011}
+    # Calibrated to 3.6 m ("Noise"). The simulator applies it beyond that as an
+    # extrapolation.
+    noise_model: "sigma = max(0.002, 0.0019 * d^2.36) m"
+    min_range_m: 0.6
+    # Not measured as a cutoff. Returns reached 5.83 m in camera_public.json;
+    # scale and noise are calibrated out to 3.6 m.
+    max_range_m: null
+    valid_fraction: 0.385
+    nan_fraction: 0.615
+    floor_returns: false
+    close_range_wedge: true
+    note: >
+      Below 0.6 m the dead zone is a diagonal wedge sweeping in from the left
+      (the structured-light baseline), not a range cutoff. The bottom third
+      of the frame never returns the floor.
+
+  point_cloud:
+    confidence: measured
+    source: >
+      camera_settled_1.json to camera_settled_3.json, 2026-09-24 (the content
+      of each run's cloud samples), and yahboomcar_astra/yahboomcar_astra/
+      sensor_adapter.py transform_cloud() (unchanged from b144d31 to 468662c)
+    note: >
+      The layout of the shipped adapter (physical_rosmaster PR #41), with
+      cloud_strip_nan true and cloud_decimation 1, the launch defaults. About
+      33,700 points, 538-542 KB per message, in the scene the robot faced. The
+      artifacts record the field names, offsets and datatypes but not how the
+      four rgb bytes are packed.
+    fields: [x, y, z, rgb]
+    point_step: 16
+    rgb_offset: 12
+    rgb_datatype: FLOAT32
+    is_bigendian: false
+    organized: false
+    is_dense: true
+    non_finite_points: stripped
+    superseded_2026_09_17:
+      confidence: measured
+      source: camera_public.json and cloud_paired.json
+      superseded_by: physical_rosmaster 317405f (16-byte packing) and d1a91ea (NaN stripping)
+      point_step: 32
+      rgb_offset: 16
+      organized: true
+      is_dense: false
+      width: 320
+      height: 240
+
+  lidar:
+    confidence: measured
+    source: sensors_stationary.json; docs/sensor_capabilities.md "LiDAR"
+    ray_count: 1080
+    angle_min_rad: -3.14159274
+    angle_max_rad: 3.14159274
+    range_min_m: 0.05
+    range_max_m: 12.0
+    scan_time_s: 0.1343
+    time_increment_s: 0.0001245
+    ray_dropout: about 25% of rays non-finite (273 of 1080 in the 2026-09-17 room)
+    self_return_mask_rays: 15
+    note: >
+      The cable/self-return mask moves 15 rays to /scan_filtered, a hardware
+      extension the simulator does not replicate (#43 decision D2).
+
+  imu:
+    confidence: measured
+    source: >
+      sensors_stationary.json (controlled stationary capture, 400 samples over
+      40 s) and yahboomcar_bringup/param/imu_filter_param.yaml
+    # Per axis: x, y, z.
+    gyro_noise_stddev_rad_s: [0.0054, 0.0051, 0.0052]
+    accel_noise_stddev_mps2: [0.135, 0.131, 0.102]
+    gravity_magnitude_mps2: 9.7554
+    orientation_source: imu_filter_madgwick
+    madgwick: {fixed_frame: base_link, use_mag: false, publish_tf: false, world_frame: enu, orientation_stddev: 0.05}
+    orientation_covariance_diag: [0.0025, 0.0025, 0.0025]
+    raw_topic: /imu/data_raw
+    covariance_note: >
+      orientation_covariance is orientation_stddev squared, which the legacy
+      bags also recorded. The angular velocity and linear acceleration
+      covariances below come from the legacy bags and have not been
+      re-measured on the current driver.
+    angular_velocity_covariance_diag: [0.0, 0.0, 0.0]
+    linear_acceleration_covariance_diag: [0.0, 0.0, 0.0]
+
+  odometry:
+    confidence: inferred
+    source: yahboomcar_bringup/param/x3_odometry.yaml (base_node_X3, wheel encoders)
+    note: >
+      Covariances are the configured values, which the file itself marks
+      provisional until ground-truth floor trials. At rest over 40 s the
+      twist was exactly 0 and the pose constant (sensors_stationary.json).
+    pose_covariance_x_y_yaw: [0.001, 0.001, 0.001]
+    twist_covariance_x_y_yaw: [0.0001, 0.0001, 0.0001]
+
+  joint_states:
+    confidence: measured
+    source: sensors_stationary.json; config/robot_contract.yaml
+    names: [front_left_wheel_joint, front_right_wheel_joint, back_left_wheel_joint, back_right_wheel_joint]
+    reports_position: true
+    reports_velocity: true
+
+  command:
+    confidence: inferred
+    source: yahboomcar_bringup/param/x3_driver.yaml
+    topic: /cmd_vel
+    timeout_s: 0.5
+    linear_x_limit_mps: 1.0
+    linear_y_limit_mps: 1.0
+    angular_z_limit_rad_s: 5.0
+
+  # Published only by hardware drivers. The simulator does not replicate them
+  # (#43 decision D2). /imu/data_raw is not among them any more: it is the
+  # Madgwick filter's input, and step 8c publishes it (topics above).
+  hardware_extensions:
+    confidence: inferred
+    source: config/robot_contract.yaml
+    topics: [/diagnostics, /imu/mag, /vel_raw, /voltage, /edition, /Buzzer, /RGBLight, /scan_filtered]
+    # config/robot_contract.yaml `simulator_published_extensions`: hardware
+    # topics the simulator publishes too.
+    simulator_published: [/imu/data_raw]
+
+simulator:
+  provenance:
+    repository: https://github.com/AIRclub-UdeSA/yahboom_rosmaster
+    nominal_source: >
+      The xacro, bridge and node configuration on main.
+      robot_description_contract_test.py fails if the xacro drifts from the
+      nominal camera, LiDAR, IMU, mount and wheel values below.
+    measured_commit: f7c931b638408043acdccdef7578f500c2b7744e
+    measurement: https://github.com/AIRclub-UdeSA/yahboom_rosmaster/issues/43#issuecomment-5814742158
+    measured_on: "2026-09-24"
+    setup: >
+      Docker (Humble, Gazebo 6.18), empty.world, headless, default launch
+      arguments, robot at rest. host_gpu figures ran on a Radeon Renoir iGPU
+      at real-time factor 0.996. llvmpipe_4cpu figures reproduce CI's
+      software rendering pinned to 4 CPUs (real-time factor 0.870).
+    tools:
+      - physical_rosmaster tools/sensor_capability_probe.py at b144d31, unmodified
+      - a sim-clock helper for latency (sim time at receipt minus header.stamp, 1 ms resolution)
+    caveats:
+      - >
+        sensor_capability_probe.py cannot run on sim time: it accepts no
+        --ros-args, so its latency fields read wall epoch minus sim time and
+        are not comparable. Its rates are wall clock, which equals sim time
+        only while the real-time factor is about 1. Every simulator latency
+        below comes from the sim-clock helper.
+      - >
+        Simulator topics have intrinsic sim-time latency even at real-time
+        factor 1. /imu/data, /odom and /joint_states stay under 1 ms. The
+        timing models of steps 6 and 8 must add their delay on top of it, not
+        assume it is zero.
+      - >
+        The 320x240 camera at 30 Hz (step 5) cuts the real-time factor on
+        CI's llvmpipe to about 0.38 with 4 CPUs (0.95 on the host GPU). It
+        still renders at 30 Hz in sim time, so stamp-based rate checks pass,
+        but each sim second costs about 2.6 wall seconds there, and wall-clock
+        rates read low.
+    # Later #43 steps re-measure only the entries they change. Every measured
+    # value not listed here comes from the step-2 baseline above.
+    step_measurements:
+      - step: 4
+        commit: ce142d779b9d623704afec341255894a3eff4dc1
+        measured_on: "2026-09-24"
+        note: >
+          Measured at d7b19796457a9a4fb29b3494bba51b37a251fe7c. Rebasing before
+          the merge rewrote it as this commit, with an identical patch.
+        keys:
+          - frames.mounts.cam_1_link
+          - frames.mounts.cam_1_depth_frame
+          - frames.mounts.cam_1_color_frame
+          - frames.camera_frames
+        method: >
+          tf2 lookups from base_link on robot_state_publisher's /tf_static,
+          empty.world, headless, host GPU. Gazebo renders from the new mount:
+          the bottom image row reads the floor at 0.20368 m, as a camera
+          108.95 mm above it predicts.
+      - step: 5
+        commit: 3e2f5095767c66d8e74880a1f2b9d7fab69c1d47
+        measured_on: "2026-09-24"
+        note: >
+          Measured at 556263d79d7f7d1be03f953b9227e22a6fcb8c99. Rebasing before
+          the merge rewrote it as this commit. The model is identical; only a
+          comment in test/depth_geometry.launch.py differs. Step 7 re-measured
+          the depth image's rate_hz and latency_ms, the cloud's rate_hz,
+          period_p95_ms and latency_ms, and depth.valid_fraction after the
+          adapter changed; those keys, and the values under them, moved to its
+          record.
+        keys:
+          - topics./cam_1/color/image_raw.frame_id
+          - topics./cam_1/color/image_raw.rate_hz
+          - topics./cam_1/color/image_raw.latency_ms
+          - topics./cam_1/color/camera_info.frame_id
+          - topics./cam_1/color/camera_info.rate_hz
+          - topics./cam_1/depth/image_raw.frame_id
+          - topics./cam_1/depth/camera_info.frame_id
+          - topics./cam_1/depth/camera_info.rate_hz
+          - topics./cam_1/depth/color/points.frame_id
+          - camera.width
+          - camera.height
+          - camera.fx
+          - camera.fy
+          - camera.cx
+          - camera.cy
+          - camera.horizontal_fov_rad
+          - camera.distortion_model
+          - camera.distortion_coefficients
+        method: >
+          physical_rosmaster tools/sensor_capability_probe.py at b144d31,
+          unmodified (--group camera --duration 30), plus the sim-clock helper
+          for latency. empty.world, headless, default launch arguments, robot
+          at rest. host_gpu ran at real-time factor 0.95 (0.92 on /clock),
+          llvmpipe_4cpu (CI's software rendering pinned to 4 CPUs) at 0.38.
+          On stamps every image and camera_info topic ran at 30.30 Hz in
+          both, and the cloud at 26.9 Hz on the host GPU and 13.0 Hz on
+          llvmpipe. Rates are the probe's wall clock on the host GPU; frames,
+          sizes and intrinsics are its content samples. Gazebo's native cloud
+          puts the rendered principal point at (159.5, 119.5) whatever the SDF
+          gives (see camera.cx).
+      - step: 6
+        commit: 2423989b02c1a65d39b57ee5535edd9a2b936e2c
+        measured_on: "2026-09-26"
+        note: >
+          First measured at 8db272aff7c5638696b98feea0e81655b08de9e4. The depth
+          image was decoupled from the cloud's pairing after that, so it was
+          measured again at this commit, the last to change the adapter. The
+          layout, the 50.0 ms latency, the whole-frame gaps, the p95 period and
+          the worst gap came out as before. The rate (8.61 to 8.69 Hz) and the
+          mean gap (3.52 to 3.49 frames) moved by less than the 0.12 frames that
+          1,000 draws from the table spread by. Step 7 changed the adapter
+          again (the depth conditioning) and re-measured the timing keys
+          (rate_hz, period_p95_ms, latency_ms, gap_frames and worst_gap_s),
+          which moved to its record; the layout keys stay here.
+        keys:
+          - point_cloud.point_step
+          - point_cloud.rgb_offset
+          - point_cloud.rgb_datatype
+          - point_cloud.is_bigendian
+          - point_cloud.organized
+          - point_cloud.is_dense
+          - point_cloud.non_finite_points
+        method: >
+          A copy of physical_rosmaster's tools/sensor_capability_probe.py from
+          #44 (feat/probe-cloud-timing, 8f7468b), run as --group camera
+          --duration 40 --camera-frame-rate 30.30303 three times in one launch,
+          on empty.world, headless, host GPU (real-time factor 0.998),
+          sensor_profile:=physical with a random seed. The one change to the
+          copy: it stamps receipt with the ROS clock on sim time, as the step-2
+          baseline says a simulator run needs, so latency_ms is sim time at
+          receipt minus header.stamp. The gap and latency figures are sim time,
+          so they hold on llvmpipe (real-time factor 0.50 with 4 CPUs), where
+          the 60 s cloud_timing_physical launch test also passed with a 50 ms
+          median latency. The layout is the probe's content sample: 16-byte
+          points, x, y, z and rgb at 0, 4, 8 and 12, all FLOAT32, height 1,
+          dense.
+
+      - step: 7
+        commit: e9b795ba96ad5f164ff05bbb02be19729490e602
+        measured_on: "2026-09-29"
+        note: >
+          The adapter did not change after d58b693; the commits after it add
+          tools, tests and documents. Step 7 re-measured the keys below after the
+          depth conditioning, and they moved here from the step 5 and step 6
+          records.
+        keys:
+          - topics./cam_1/depth/image_raw.rate_hz
+          - topics./cam_1/depth/image_raw.latency_ms
+          - topics./cam_1/depth/color/points.rate_hz
+          - topics./cam_1/depth/color/points.period_p95_ms
+          - topics./cam_1/depth/color/points.latency_ms
+          - topics./cam_1/depth/color/points.gap_frames
+          - topics./cam_1/depth/color/points.worst_gap_s
+          - depth.scale_error
+          - depth.min_range_m
+          - depth.valid_fraction
+          - depth.nan_fraction
+        method: >
+          The camera keys: tools/measure_cloud_timing.py, which runs
+          physical_rosmaster's tools/sensor_capability_probe.py (with
+          physical_contract_probe.py, fetched at 468662c with git show and
+          patched to stamp receipt with the ROS clock on sim time) as --group
+          camera --duration 40 --camera-frame-rate 30.30303 --per-message, three
+          times in one launch, on empty.world, headless, under
+          sensor_profile:=physical with a random seed and PYTHONNOUSERSITE=1
+          (numpy 1.21.5), on the host GPU (real-time factor 0.998) and on
+          llvmpipe pinned to four CPUs (about 0.5). Pooled: 993 gaps on the GPU
+          (median 2, p95 11, longest 32, mean 3.60 frames; 8.42 Hz, p95 period
+          363 ms, worst gap 1.056 s; cloud latency 50 ms in every run) and 492 on
+          llvmpipe (median 2, p95 10, longest 34, mean 3.52; 8.61 Hz on stamps).
+          The depth image ran at 30.303 Hz on stamps on both, with a latency of 9
+          ms (p95 11) on the GPU and 36 ms (p95 38) on llvmpipe; the alternating
+          comparison with main gave 6 to 9 ms and 34 to 36 ms. valid_fraction is
+          the mean of the depth content samples, 0.186 on both. The depth keys:
+          sensor_contract_probe under the full suite on the host GPU, which pairs
+          the published depth with the render of the same stamp: a scale error
+          of -0.01179 (standard error 0.00005) on empty.world and -0.01185 on
+          cafe.world, and the lowest finite depth 0.600003 m.
+      - step: 8
+        part: a
+        commit: 2ffb7b33d8da2b0f9e79916edcd60f4fc9416fdf
+        measured_on: "2026-10-01"
+        note: >
+          #43 step 8a (commands and odometry). The simulator code under test is
+          d737590; the commits after it change only the measurement tools and
+          base_feedback_probe.py. The rates were measured at 8306b8a, before
+          that probe change, with the same simulator code.
+        keys:
+          - topics./odom.rate_hz
+          - topics./joint_states.rate_hz
+          - command.linear_x_limit_mps
+          - command.linear_y_limit_mps
+          - command.angular_z_limit_rad_s
+          - odometry.pose_covariance_x_y_yaw
+          - odometry.twist_covariance_x_y_yaw
+        method: >
+          The rates: tools/measure_cloud_timing.py --group stationary, which runs
+          physical_rosmaster's tools/sensor_capability_probe.py (with
+          physical_contract_probe.py, fetched at 468662c with git show and
+          patched to stamp receipt with the ROS clock on sim time) as --group
+          lidar --group imu --group odom --group health --duration 40
+          --per-message, three times in one launch, on empty.world, headless,
+          under sensor_profile:=physical with PYTHONNOUSERSITE=1 (numpy 1.21.5):
+          /odom (1,167 messages) and /joint_states (1,155) at 9.804 Hz on stamps,
+          102 ms apart (median and p95), on the host GPU, and 9.804 Hz on
+          llvmpipe pinned to four CPUs; main gave 29.412 Hz (34 ms). The
+          limits: base_feedback_probe publishes (3.0, 0.5, 9.0) and then
+          (0.5, -3.0, 0.2) and reads /cmd_vel_gz, which carries exactly
+          (1.0, 0.5, 5.0) and (0.5, -1.0, 0.2), each component saturated on its
+          own and the others untouched. The covariance: ros2 topic echo /odom, which
+          shows 0.001 at indices 0, 7 and 35 of the pose and 0.0001 at 0 and 7 of
+          the twist, zero elsewhere (35 of the twist is covered by
+          test/wheel_state_odometry_test.py). The real-time factor and the CPU of
+          wheel_state_odometry.py and cmd_vel_watchdog.py, main against this
+          branch, alternating, five runs each on the host GPU with numpy 1.21.5:
+          0.999 against 0.999; 3.27% (3.20-3.33) against 1.17% (1.17-1.23) of
+          one core, and 1.77% against 1.80%.
+      - step: 8
+        part: b
+        commit: 46191b7aa4f7a44f942edda2cb763bd38875eba0
+        measured_on: "2026-10-01"
+        note: >
+          #43 step 8b (LiDAR timing), on the branch stacked on step 8a. The
+          simulator code under test is 216cc75 (the relay, the xacro, the scan
+          launch and the lidar profile); later commits change probes, the ledger
+          and documents.
+        keys:
+          - topics./scan.rate_hz
+          - topics./scan.latency_ms
+          - lidar.scan_time_s
+        method: >
+          tools/measure_cloud_timing.py --group stationary, which runs
+          physical_rosmaster's tools/sensor_capability_probe.py (with
+          physical_contract_probe.py, fetched at 468662c with git show and
+          patched to stamp receipt with the ROS clock on sim time) as --group
+          lidar --group imu --group odom --group health --duration 40
+          --per-message, three times in one launch, on empty.world, headless,
+          under sensor_profile:=physical with PYTHONNOUSERSITE=1 (numpy 1.21.5).
+          On the host GPU /scan came 139 ms apart (median and p95), 7.194 Hz on
+          stamps over 857 messages, 143 ms after its stamp (p95 148), with
+          scan_time 0.1343 and time_increment 0; on llvmpipe pinned to four CPUs
+          7.194 Hz and 157 ms (p95 173). Main on the same machine: 5.000 Hz, 4 ms
+          (p95 8) on the GPU and 18.5 ms (p95 34) on llvmpipe, so the hold adds one
+          139 ms period to a delivery latency of 4 to 5 ms (the old laptop's 38 and
+          120 ms do not hold here). The real-time factor and the CPU of the scan
+          relay, main against this branch, alternating, five runs each on the host
+          GPU with numpy 1.21.5: 0.999 (0.997-1.000) against 0.997 (0.996-0.999);
+          0.33% (0.27-0.37) against 0.50% (0.47-0.50) of one core.
+      - step: 8
+        part: c
+        commit: 64d6925697005c7053f5de78cc6aa98a2c71052e
+        measured_on: "2026-10-01"
+        note: >
+          Measured at 30375de5015451bc63e7c5963cb7044b94d29af3. GitHub's
+          stacked-PR update rewrote it as this commit when #62 merged, with an
+          identical tree. #43 step 8c (IMU), on the branch stacked on step 8b. The
+          simulator code under test is this commit's: the xacro, the bridge,
+          imu_raw_relay.py, the filter's config and the launch. Later commits
+          change only the ledger.
+        keys:
+          - topics./imu/data_raw.rate_hz
+          - imu.gyro_noise_stddev_rad_s
+          - imu.accel_noise_stddev_mps2
+          - imu.orientation_source
+          - imu.orientation_covariance_diag
+          - imu.raw_topic
+        method: >
+          tools/measure_cloud_timing.py --group stationary, which runs
+          physical_rosmaster's tools/sensor_capability_probe.py (with
+          physical_contract_probe.py, fetched at 468662c with git show and
+          patched to stamp receipt with the ROS clock on sim time) as --group
+          lidar --group imu --group odom --group health --duration 40
+          --per-message, three times in one launch, on empty.world, headless,
+          under sensor_profile:=physical with PYTHONNOUSERSITE=1 (numpy 1.21.5).
+          On the host GPU /imu/data_raw (1,180 messages) and /imu/data (1,156)
+          came at 10.0 Hz on stamps, 100 ms apart, and the standard deviations of
+          /imu/data_raw were gyro 0.00548, 0.00505, 0.00517 rad/s and accel 0.13725,
+          0.13185, 0.10115 m/s^2 (llvmpipe: 0.00539, 0.00493, 0.00546 and 0.13156,
+          0.12528, 0.10156); main gave about 0.0087 (gyro) and 0.0017 (accel) on every axis.
+          imu_motion_probe, on 200 stationary raw samples, graded the noise within
+          four standard errors (20%) of the ledger: 0.0051, 0.0052, 0.0050 and
+          0.1368, 0.1349, 0.0953. The probe also read the filter's publisher node
+          (imu_filter_madgwick), its orientation covariance (0.0025 on the
+          diagonal, zero elsewhere) and the raw topic's content (the identity
+          quaternion, all covariances zero, Reliable). The real-time factor and the
+          CPU of imu_raw_relay.py and imu_filter_madgwick, main against this
+          branch, alternating, five runs each on the host GPU with numpy 1.21.5:
+          0.999 (0.998-1.000) against 0.999 (0.997-0.999); 0.73% (0.70-0.77) and
+          0.17% (0.13-0.20) of one core, neither process existing on main.
+      - step: 9
+        commit: 158420900105678cea336d82994e3059d366e3c8
+        measured_on: "2026-10-03"
+        note: >
+          #43 step 9 (parity check in CI). The simulator code under test is
+          1584209; the commits after it change only the harness (a CLI warning
+          filter), a comment in test/sim_timing.py and this record.
+        keys:
+          - topics./joint_states.frame_id
+        method: >
+          tools/measure_physical_probe.py, 30 fresh simulator launches on the host
+          GPU (empty.world, headless, sensor_profile:=physical, sensor_seed 101 to
+          130, PYTHONNOUSERSITE=1), each reading one /joint_states message with
+          `ros2 topic echo --once --field header.frame_id` 15 s after the cloud
+          appeared: joint_states in 29 runs (the 30th printed a CLI notice that
+          the topic was not yet published, and no message); main gave base_link.
+          The same runs ran physical_rosmaster's tools/physical_contract_probe.py at
+          fa56a87 (git blob 02d4e5c, target:=simulator, use_sim_time, samples:=10):
+          30 of 30 passed on the GPU (real-time factor 0.996, 0.936-1.067; the
+          probe took 3.4 s, 2.5-5.6 s). On the CI gate's llvmpipe recipe (four
+          CPUs) it passed in 10 of 10 fresh launches (the last five at 1584209:
+          real-time factor 0.486, 0.471-0.487; the probe took 5.0 s, 3.7-7.4 s),
+          and in the gate itself, five runs alternating with main, it added 3.1 s
+          to a median of 164.5 s (range 163.0-167.6 to 166.1-169.3). The full suite on the GPU, five
+          sequential passes, ran the probe in each of the four sensor_contract_*
+          targets, 20 of 20 passed.
+  frames:
+    base_footprint_to_base_link_z_m:
+      nominal: 0.0714
+      measured: 0.0714
+      matches_physical: true
+      note: >
+        #42 (PR #44). /ground_truth/odom z at rest is -5.76e-7 m, so
+        base_footprint is on the floor.
+    mounts:
+      cam_1_link:
+        nominal: {xyz: [0.057105, 0.000017948, 0.03755], rpy: [0.0, 0.0, 0.0]}
+        measured: {xyz: [0.057105, 0.000017948, 0.03755], rpy: [0.0, 0.0, 0.0]}
+        matches_physical: true
+        note: >
+          #43 step 4; was (0.105, 0, 0.05). cad_visual/camera.obj is generated
+          relative to it.
+      cam_1_depth_frame:
+        nominal: {xyz: [0.057105, 0.000017948, 0.03755], rpy: [0.0, 0.0, 0.0]}
+        measured: {xyz: [0.057105, 0.000017948, 0.03755], rpy: [0.0, 0.0, 0.0]}
+        matches_physical: true
+        note: '#43 step 4. Identity to cam_1_link, as on the physical robot.'
+      cam_1_color_frame:
+        nominal: {xyz: [0.054937, 0.025094, 0.037410], rpy: [-0.000336, 0.004697, 0.003574]}
+        measured: {xyz: [0.054937, 0.025094, 0.037410], rpy: [-0.000336, 0.004697, 0.003574]}
+        matches_physical: true
+        note: >
+          #43 step 4; was co-located with the depth frame. The Orbbec factory
+          calibration of Astra ACRC64300ET, 25.1 mm left of depth; another
+          unit differs slightly. Since step 5 the Gazebo RGB-D camera renders
+          both images from here, as the Astra registers depth to color.
+      laser_link:
+        nominal: {xyz: [0.043, 0.0, 0.110], rpy: [0.0, 0.0, 3.141592653589793]}
+        tolerance: 0.001
+        matches_physical: true
+        note: x is rounded 0.5 mm short of the physical 0.0435.
+      imu_link:
+        nominal: {xyz: [-0.06, 0.01, 0.01], rpy: [0.0, 3.1415, 1.5707]}
+        tolerance: 0.001
+        matches_physical: true
+        note: rpy is pi and pi/2 truncated to 4 decimals.
+    camera_frames:
+      nominal:
+        - cam_1_link
+        - cam_1_depth_frame
+        - cam_1_depth_optical_frame
+        - cam_1_color_frame
+        - cam_1_color_optical_frame
+      measured:
+        - cam_1_link
+        - cam_1_depth_frame
+        - cam_1_depth_optical_frame
+        - cam_1_color_frame
+        - cam_1_color_optical_frame
+      matches_physical: true
+      note: '#43 step 4 removed cam_1_infra1_* and cam_1_infra2_*, which the physical robot does not publish.'
+
+  wheels:
+    radius_m:
+      nominal: 0.0325
+      matches_physical: true
+    origins:
+      nominal:
+        front_left: [0.08, 0.0845, -0.0389]
+        front_right: [0.08, -0.0845, -0.0389]
+        back_left: [-0.08, 0.0845, -0.0389]
+        back_right: [-0.08, -0.0845, -0.0389]
+      tolerance: 0.001
+      matches_physical: true
+      note: Symmetric. The physical xacro's back axles sit 0.6 mm lower.
+    odometry_wheelbase_m:
+      nominal: 0.16
+      matches_physical: true
+    odometry_track_width_m:
+      nominal: 0.169
+      matches_physical: false
+      closes_in_step: out_of_scope
+      note: >
+        The physical base_node uses 0.170 against the 0.168992 m wheel
+        separation of its own xacro. Drivetrain calibration is #17.
+
+  topics:
+    /cam_1/color/image_raw:
+      frame_id:
+        nominal: cam_1_color_optical_frame
+        measured: cam_1_color_optical_frame
+        matches_physical: true
+        note: '#43 step 5; was cam_1_depth_optical_frame.'
+      encoding:
+        nominal: rgb8
+        matches_physical: true
+      rate_hz:
+        nominal: 30.0
+        contract: [27.0, 33.0]
+        measured: 28.75
+        tolerance: 0.5
+        matches_physical: true
+        note: >
+          #43 step 5; was 5 Hz. With the 1 ms physics step Gazebo fires every
+          33 ms of sim time, so the stamps run at 30.3 Hz.
+      latency_ms:
+        measured: {host_gpu: 21, llvmpipe_4cpu: 33}
+        matches_physical: false
+        closes_in_step: out_of_scope
+        note: >
+          No step adds image latency: the simulator's intrinsic latency
+          already exceeds the physical 2-6 ms. At 5 Hz (step 2) it was 16 ms
+          and 64-66 ms.
+      reliability:
+        nominal: best_effort
+        matches_physical: true
+    /cam_1/color/camera_info:
+      frame_id:
+        nominal: cam_1_color_optical_frame
+        measured: cam_1_color_optical_frame
+        matches_physical: true
+        note: '#43 step 5; was cam_1_depth_optical_frame.'
+      rate_hz:
+        nominal: 30.0
+        contract: [27.0, 33.0]
+        measured: 28.76
+        tolerance: 0.5
+        matches_physical: true
+        note: >
+          #43 step 5; was 5 Hz. With the 1 ms physics step Gazebo fires every
+          33 ms of sim time, so the stamps run at 30.3 Hz.
+      reliability:
+        nominal: best_effort
+        matches_physical: true
+    /cam_1/depth/image_raw:
+      frame_id:
+        nominal: cam_1_color_optical_frame
+        measured: cam_1_color_optical_frame
+        matches_physical: true
+        note: '#43 step 5; was cam_1_depth_optical_frame.'
+      encoding:
+        nominal: 32FC1
+        matches_physical: true
+      rate_hz:
+        nominal: 30.0
+        contract: [27.0, 33.0]
+        measured: 30.21
+        tolerance: 0.5
+        matches_physical: true
+        note: >
+          #43 step 5; was 5 Hz. With the 1 ms physics step Gazebo fires every
+          33 ms of sim time, so the stamps run at 30.3 Hz. Re-measured in step 7
+          after the depth conditioning: 30.20 to 30.21 Hz on wall time on the host
+          GPU (three 40 s runs), 30.303 Hz on stamps on both render paths.
+      latency_ms:
+        measured: {host_gpu: 9, llvmpipe_4cpu: 36}
+        matches_physical: false
+        closes_in_step: out_of_scope
+        note: >
+          The simulator's intrinsic latency already exceeded the physical
+          2.2 ms: 16 ms and 64-66 ms at 5 Hz (step 2), 20 and 33 ms with
+          the step-5 camera. Step 7's depth conditioning adds about 3 ms of sim
+          time (6 to 9 ms on the host GPU in the alternating comparison with
+          main, 34 to 36 ms on llvmpipe), because the image is published after it.
+          The simulator still exceeds the physical latency, so out_of_scope
+          stands. The step-7 figures are the physical probe's, on sim time, and
+          include its own subscription's load.
+      reliability:
+        nominal: best_effort
+        matches_physical: true
+    /cam_1/depth/camera_info:
+      frame_id:
+        nominal: cam_1_color_optical_frame
+        measured: cam_1_color_optical_frame
+        matches_physical: true
+        note: '#43 step 5; was cam_1_depth_optical_frame.'
+      rate_hz:
+        nominal: 30.0
+        contract: [27.0, 33.0]
+        measured: 28.75
+        tolerance: 0.5
+        matches_physical: true
+        note: >
+          #43 step 5; was 5 Hz. With the 1 ms physics step Gazebo fires every
+          33 ms of sim time, so the stamps run at 30.3 Hz.
+      reliability:
+        nominal: best_effort
+        matches_physical: true
+    /cam_1/depth/color/points:
+      frame_id:
+        nominal: cam_1_depth_frame
+        measured: cam_1_depth_frame
+        matches_physical: true
+        note: >
+          Gazebo's cloud is in cam_1_color_frame. Since #43 step 6 the camera
+          adapter builds the cloud from the images and transforms it into
+          cam_1_depth_frame with the static TF, as the physical
+          sensor_adapter.py does.
+      # The timing entries follow config/sensor_profiles.yaml under the default
+      # sensor_profile:=physical; real_robot_contract_test.py derives them from
+      # it. The frame period there is the simulated camera's 33 ms, not the
+      # robot's 33.3 ms, which the tolerances absorb.
+      rate_hz:
+        nominal: 8.36
+        # What sensor_contract_probe grades: the mean rate over its window of a
+        # few clouds. The 9-gap mean rate falls under 2.8 Hz once in 10,000
+        # windows, so a correct simulator is not failed for a run of long gaps.
+        contract: [2.5, 33.0]
+        measured: 8.42
+        tolerance: 0.2
+        matches_physical: true
+        note: >
+          #43 step 6; was 30 Hz. The mean of the measured gap table, 3.62
+          frames of 33 ms. Re-measured in step 7 after the adapter changed: three
+          40 s probe runs on the host GPU gave 8.42, 8.52 and 8.24 Hz on wall
+          time and 8.42 pooled on stamps (mean gap 3.60 frames), against the
+          robot's 7.3-9.2 Hz settled runs; on llvmpipe the stamps gave 8.61 Hz
+          (mean gap 3.52 frames, 492 gaps) though wall time reads 4.0 to 4.4 Hz.
+          Step 6's runs gave 8.95, 8.45 and 8.49 Hz (8.69 pooled): a 40 s run
+          holds only about 340 clouds, so runs of either spread about a hertz.
+          sensor_profile:=ideal delivers every frame, at 30.3 Hz.
+      period_p95_ms:
+        nominal: 363
+        measured: 363
+        tolerance: 5
+        matches_physical: true
+        note: >
+          #43 step 6; was 66 ms. 11 frames of 33 ms. The robot's 11 frames are
+          33.3 ms each: 367 ms. Step 7's 993 gaps on the host GPU gave 11 frames,
+          363 ms; its 492 gaps on llvmpipe gave 10, 330 ms (step 6's 1,006 gave 10
+          as well, which draws from the table give about one time in five).
+      latency_ms:
+        nominal: 50
+        measured: {host_gpu: 50, llvmpipe_4cpu: 50}
+        tolerance: 5
+        matches_physical: true
+        note: >
+          #43 step 6; was 31 and 46 ms. The cloud leaves 50 ms of sim time after
+          the stamp of its frame, which the images reach the adapter well
+          before: 7-8 ms on the host GPU and 35 ms on llvmpipe with 4 CPUs in
+          step 6, 3 ms later with step 7's depth conditioning. Re-measured in
+          step 7: a 50.0 ms median in every run on both render paths (p95 50 and
+          51 ms). The tolerance covers the robot's 43-53 ms run medians.
+      gap_frames:
+        nominal: {median: 2, p95: 11, longest: 34, mean: 3.625}
+        measured: {median: 2, p95: 11, longest: 32, mean: 3.6}
+        tolerance: 0.01
+        matches_physical: true
+        note: >
+          #43 step 6. Drawn from the robot's measured table (988 gaps, whole
+          frames only). Re-measured in step 7 over 993 gaps from three 40 s runs
+          on the host GPU: 31.9% of gaps were one frame against the table's
+          33.1%, no gap length differed from the table by more than 1.4
+          percentage points, and none was off the frame grid.
+      worst_gap_s:
+        nominal: 1.122
+        measured: 1.056
+        tolerance: 0.02
+        matches_physical: true
+        note: >
+          #43 step 6. The longest gap in the table, 34 frames of 33 ms. Step 7's
+          pooled sample on the host GPU had 32 frames, 1.056 s (llvmpipe's, 492
+          gaps, 34 frames, 1.123 s).
+      reliability:
+        nominal: best_effort
+        matches_physical: true
+    /scan:
+      frame_id:
+        nominal: laser_link
+        matches_physical: true
+      rate_hz:
+        nominal: 7.17
+        contract: [6.5, 7.8]
+        measured: 7.194
+        matches_physical: true
+        note: >
+          #43 step 8b; was 5 Hz. Gazebo fires a sensor on whole 1 ms physics
+          steps, so the stamps come every 139 ms (1 / 7.17 s is 139.5 ms), 7.194
+          Hz, against the robot's 7.17. The contract range brackets both.
+      latency_ms:
+        nominal: 143.0
+        measured: {host_gpu: 143, llvmpipe_4cpu: 157}
+        tolerance: 8.0
+        matches_physical: true
+        note: >
+          #43 step 8b; was 5 ms on the GPU and 18.5 on llvmpipe (main, this
+          machine). Under the physical profile each scan is published when the
+          next one arrives: one scan period (139 ms) plus the simulator's own
+          delivery latency (about 4 ms on the GPU), where the robot's 135.7 ms is
+          its 134.3 ms sweep plus about 1.4 ms. The tolerance covers that
+          difference of 7.3 ms. Under ideal it is the delivery latency alone.
+      reliability:
+        nominal: best_effort
+        matches_physical: true
+    /imu/data:
+      frame_id:
+        nominal: imu_link
+        matches_physical: true
+      rate_hz:
+        nominal: 10.0
+        contract: [8.0, 12.0]
+        measured: 9.97
+        matches_physical: true
+    /imu/data_raw:
+      frame_id:
+        nominal: imu_link
+        matches_physical: true
+      rate_hz:
+        nominal: 10.0
+        contract: [8.0, 12.0]
+        measured: 10.0
+        tolerance: 0.1
+        matches_physical: true
+        note: '#43 step 8c; the topic is new. One message per IMU sample.'
+      reliability:
+        nominal: reliable
+        matches_physical: true
+      orientation:
+        nominal: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+        matches_physical: true
+        note: >
+          #43 step 8c. The identity quaternion the driver leaves in it, not
+          Gazebo's orientation.
+      covariances:
+        nominal: all_zero
+        matches_physical: true
+    /odom:
+      frame_id:
+        nominal: odom
+        matches_physical: true
+      child_frame_id:
+        nominal: base_footprint
+        matches_physical: true
+      rate_hz:
+        nominal: 10.0
+        contract: [8.0, 12.0]
+        measured: 9.804
+        tolerance: 0.3
+        matches_physical: true
+        note: >
+          #43 step 8a; was 30 (29.41 on stamps). Follows /joint_states, one message each.
+      reliability:
+        nominal: reliable
+        matches_physical: true
+    /joint_states:
+      frame_id:
+        nominal: joint_states
+        measured: joint_states
+        matches_physical: true
+        note: >
+          #43 step 9; was base_link, joint_state_broadcaster's default. Set with
+          its `frame_id` parameter in config/ros2_control.yaml, as the robot's
+          driver does. Nothing consumes it: the physical contract probe requires
+          it to be non-empty.
+      rate_hz:
+        nominal: 10.0
+        contract: [8.0, 12.0]
+        measured: 9.804
+        tolerance: 0.3
+        matches_physical: true
+        note: >
+          #43 step 8a; was 30 (29.41 on stamps). Stamps come 102 ms apart: three 34 ms controller steps. joint_state_broadcaster's own update_rate of 10
+          under the controller manager's 30 Hz loop.
+
+  camera:
+    width:
+      nominal: 320
+      measured: 320
+      matches_physical: true
+      note: '#43 step 5; was 424.'
+    height:
+      nominal: 240
+      measured: 240
+      matches_physical: true
+    fx:
+      nominal: 271.809387
+      measured: 271.809387
+      tolerance: 0.001
+      matches_physical: true
+      note: >
+        #43 step 5; was 223.40954. The xacro uses camera_public.json's
+        271.80938720703125, which the physical section rounds to 271.809.
+    fy:
+      nominal: 271.809387
+      measured: 271.809387
+      tolerance: 0.001
+      matches_physical: true
+      note: '#43 step 5; see fx.'
+    cx:
+      nominal: 159.5
+      measured: 159.5
+      tolerance: 0.8
+      matches_physical: true
+      note: >
+        #43 step 5; was 212.0. Fortress renders a symmetric frustum whatever
+        principal point the SDF gives: (158.719, 120.092) and (140, 100)
+        rendered bit-identical images and changed only camera_info. Gazebo's
+        own rays put that frustum's axis at (159.5, 119.5) in ROS pixel
+        coordinates, so the simulator publishes it, 0.78 px from physical.
+        Gazebo's default of width / 2 = 160 is half a pixel off its own image.
+    cy:
+      nominal: 119.5
+      measured: 119.5
+      tolerance: 0.6
+      matches_physical: true
+      note: '#43 step 5; was 120.0, half a pixel off the rendered image. 0.59 px from physical; see cx.'
+    horizontal_fov_rad:
+      nominal: 1.064061
+      measured: 1.064061
+      tolerance: 0.00001
+      matches_physical: true
+      note: >
+        #43 step 5; was 1.5184. 2 atan(160 / fx) is 1.0640610 rad; the
+        physical section rounds it to 1.06406. Gazebo renders from it.
+    distortion_model:
+      nominal: plumb_bob
+      measured: plumb_bob
+      matches_physical: true
+    distortion_coefficients:
+      nominal: [0.0, 0.0, 0.0, 0.0, 0.0]
+      measured: [0.0, 0.0, 0.0, 0.0, 0.0]
+      matches_physical: true
+
+  # Settings of the simulator with no physical counterpart: not parity entries
+  # (see the header). The camera's own clip planes, as the xacro sets them.
+  render_settings:
+    depth_near_clip_m:
+      nominal: 0.05
+      note: >
+        The depth camera's near clip plane. The render has no return closer
+        than this. Under sensor_profile:=physical the profile's minimum range
+        (depth.min_range_m, 0.6 m) is applied on top of it.
+    depth_far_clip_m:
+      nominal: 8.0
+      note: >
+        The depth camera's far clip plane. Beyond it the render has no return
+        (+inf), which the adapter publishes as NaN. depth.max_range_m is the
+        parity row for the same limit.
+
+  depth:
+    scale_error:
+      nominal: -0.011858
+      measured: -0.01179
+      matches_physical: true
+      note: >
+        #43 step 7; was none. The inverse of the calibration doc's recommended
+        correction, true ~= reported * 1.012, applied under
+        sensor_profile:=physical. It lies inside the physical range, which
+        real_robot_contract_test checks. The linear fit's slope was -1.33%,
+        just outside that range. Measured in step 7 by sensor_contract_probe,
+        which pairs the published depth with the render of the same stamp, on
+        empty.world on the host GPU: -0.01179 (standard error 0.00005, 49,140
+        pixels rendered 1.5 m or more away, 10 frames); cafe.world gave -0.01185
+        (0.00002, 441,600 pixels). The noise it read in seven bands from 0.65 to
+        8.1 m was within 1% of the model's in every band (142 mm against 140 at
+        5 to 8.1 m).
+    noise_model:
+      nominal: "sigma = max(0.002, 0.0019 * d^2.36) m"
+      matches_physical: true
+      note: >
+        #43 step 7; was none. Under sensor_profile:=physical, from the scaled
+        depth. The fit is calibrated to 3.6 m and the simulator applies it
+        beyond that as an extrapolation: about 12 cm at 5.8 m and 25 cm at the
+        8 m far clip. sensor_profiles.yaml carries the numbers, and
+        real_robot_contract_test checks that they give this string.
+    min_range_m:
+      nominal: 0.6
+      measured: 0.6
+      matches_physical: true
+      note: >
+        #43 step 7; was 0.05, which is now render_settings.depth_near_clip_m.
+        Under sensor_profile:=physical nothing below it is published: a pixel
+        whose depth, after scale and noise, is under 0.6 m is NaN. The lowest
+        finite depth in the 12 content samples of the step-7 probe runs was
+        0.600003 m.
+    max_range_m:
+      nominal: 8.0
+      matches_physical: false
+      closes_in_step: out_of_scope
+      note: >
+        The physical far limit has not been measured. The simulator's is the
+        camera's far clip, render_settings.depth_far_clip_m.
+    valid_fraction:
+      measured: 0.186
+      matches_physical: false
+      closes_in_step: out_of_scope
+      note: >
+        Scene-dependent, not a parity check: the fraction of finite pixels
+        depends on what the camera faces far more than on the camera, and the
+        physical 0.385 is one scene. The floor dropout and the close-range wedge
+        (yahboom_rosmaster#59) are part of why the two differ. Measured on
+        empty.world, whose floor is all that returns, with the robot at rest:
+        0.186 under sensor_profile:=physical (0.489 before step 7, when the
+        floor returned from 0.25 m). The floor from 0.6 m out is 45 of 240 rows.
+    nan_fraction:
+      measured: 0.814
+      matches_physical: false
+      closes_in_step: out_of_scope
+      note: >
+        Scene-dependent, not a parity check; see valid_fraction and
+        yahboom_rosmaster#59. Since #43 step 7 a pixel with no return is NaN
+        under both profiles, as on the robot; it was +inf. Measured on
+        empty.world as for valid_fraction: 0.814 (0.0 before, all of it inf).
+    floor_returns:
+      nominal: true
+      matches_physical: false
+      closes_in_step: out_of_scope
+      note: >
+        Moved out of step 7 to yahboom_rosmaster#59: needs an incidence-angle
+        model.
+    close_range_wedge:
+      nominal: false
+      matches_physical: false
+      closes_in_step: out_of_scope
+      note: >
+        Moved out of step 7 to yahboom_rosmaster#59: needs an incidence-angle
+        model. Below 0.6 m the simulator publishes NaN by range alone.
+
+  point_cloud:
+    fields:
+      measured: [x, y, z, rgb]
+      matches_physical: true
+    point_step:
+      nominal: 16
+      measured: 16
+      matches_physical: true
+      note: '#43 step 6; was 24.'
+    rgb_offset:
+      nominal: 12
+      measured: 12
+      matches_physical: true
+      note: '#43 step 6; was 16.'
+    rgb_datatype:
+      nominal: FLOAT32
+      measured: FLOAT32
+      matches_physical: true
+      note: >
+        The four bytes are the little-endian float32 of the 0x00RRGGBB integer
+        of the ROS and PCL convention, which is also Gazebo's own packing: a
+        red pixel is the bytes 0, 0, 255, 0. The physical artifacts record the
+        datatype and offset but not the packing.
+    is_bigendian:
+      nominal: false
+      measured: false
+      matches_physical: true
+    organized:
+      nominal: false
+      measured: false
+      matches_physical: true
+      note: >
+        #43 step 6; was organized 320x240. cloud_strip_nan:=false keeps the
+        organized cloud, as on the robot.
+    is_dense:
+      nominal: true
+      measured: true
+      matches_physical: true
+      note: '#43 step 6. True because the non-finite points are stripped.'
+    non_finite_points:
+      nominal: stripped
+      measured: stripped
+      matches_physical: true
+      note: '#43 step 6; was inf beyond the far clip, left in place.'
+
+  lidar:
+    ray_count:
+      nominal: 1080
+      measured: 1080
+      matches_physical: true
+    angle_min_rad:
+      nominal: -3.14159
+      tolerance: 0.00001
+      matches_physical: true
+    angle_max_rad:
+      nominal: 3.14159
+      tolerance: 0.00001
+      matches_physical: true
+    range_min_m:
+      nominal: 0.05
+      matches_physical: true
+    range_max_m:
+      nominal: 12.0
+      matches_physical: true
+    scan_time_s:
+      nominal: 0.1343
+      measured: 0.1343
+      matches_physical: true
+      note: >
+        #43 step 8b; was 0. The robot's value: one sweep, not the period. Both
+        sensor profiles carry it (config/sensor_profiles.yaml).
+    time_increment_s:
+      measured: 0.0
+      matches_physical: false
+      closes_in_step: out_of_scope
+      note: >
+        #43 decision D3 (confirmed 2026-10-01) keeps it at 0: gpu_lidar is an
+        instant snapshot, so a non-zero value would make consumers correct for
+        motion that never happened. Matching it would take a rolling-scan
+        emulation, an optional follow-up.
+    ray_dropout:
+      nominal: none
+      matches_physical: false
+      closes_in_step: out_of_scope
+      note: Listed as out of scope in #43.
+
+  imu:
+    gyro_noise_stddev_rad_s:
+      nominal: [0.0054, 0.0051, 0.0052]
+      measured: [0.0055, 0.0050, 0.0052]
+      matches_physical: true
+      note: >
+        #43 step 8c; was [0.00873, 0.00873, 0.00873]. Per axis, from the
+        `physical` sensor profile; under `ideal` there is none.
+    accel_noise_stddev_mps2:
+      nominal: [0.135, 0.131, 0.102]
+      measured: [0.137, 0.132, 0.101]
+      matches_physical: true
+      note: >
+        #43 step 8c; was [0.00175, 0.00175, 0.00175], 75 times too small on
+        x. Per axis, from the `physical` sensor profile.
+    orientation_source:
+      nominal: imu_filter_madgwick
+      measured: imu_filter_madgwick
+      matches_physical: true
+      note: >
+        #43 step 8c; was gazebo. The stock imu_filter_madgwick node with the
+        robot's parameters (config/imu_filter_madgwick.yaml), under both profiles.
+    orientation_covariance_diag:
+      nominal: [0.0025, 0.0025, 0.0025]
+      measured: [0.0025, 0.0025, 0.0025]
+      tolerance: 1.0e-9
+      matches_physical: true
+      note: '#43 step 8c; was [0, 0, 0]. orientation_stddev 0.05 squared.'
+    raw_topic:
+      nominal: /imu/data_raw
+      measured: /imu/data_raw
+      matches_physical: true
+      note: '#43 step 8c; was none.'
+    angular_velocity_covariance_diag:
+      nominal: [0.0, 0.0, 0.0]
+      matches_physical: true
+    linear_acceleration_covariance_diag:
+      nominal: [0.0, 0.0, 0.0]
+      matches_physical: true
+
+  odometry:
+    pose_covariance_x_y_yaw:
+      nominal: [0.001, 0.001, 0.001]
+      measured: [0.001, 0.001, 0.001]
+      matches_physical: true
+      note: >
+        #43 step 8a; was [0.001, 0.001, 0.01]. The simulator now fills only the
+        x, y and yaw diagonal entries (indices 0, 7, 35), as the robot does;
+        z, roll and pitch used to carry 0.001 and are now zero.
+    twist_covariance_x_y_yaw:
+      nominal: [0.0001, 0.0001, 0.0001]
+      measured: [0.0001, 0.0001, 0.0001]
+      matches_physical: true
+      note: >
+        #43 step 8a; was [0.001, 0.001, 0.01]. Same layout as the pose.
+
+  joint_states:
+    names:
+      nominal: [front_left_wheel_joint, front_right_wheel_joint, back_left_wheel_joint, back_right_wheel_joint]
+      matches_physical: true
+    reports_position:
+      nominal: true
+      matches_physical: true
+    reports_velocity:
+      nominal: true
+      matches_physical: true
+
+  command:
+    timeout_s:
+      nominal: 0.5
+      matches_physical: true
+    linear_x_limit_mps:
+      nominal: 1.0
+      measured: 1.0
+      matches_physical: true
+      note: >
+        #43 step 8a; was unclamped. cmd_vel_watchdog.py saturates the component
+        before it applies any motion bias, as the driver's
+        clamp_motion_command does (config/command_limits.yaml).
+    linear_y_limit_mps:
+      nominal: 1.0
+      measured: 1.0
+      matches_physical: true
+      note: >
+        #43 step 8a; was unclamped. cmd_vel_watchdog.py saturates the component
+        before it applies any motion bias, as the driver's
+        clamp_motion_command does (config/command_limits.yaml).
+    angular_z_limit_rad_s:
+      nominal: 5.0
+      measured: 5.0
+      matches_physical: true
+      note: >
+        #43 step 8a; was unclamped. cmd_vel_watchdog.py saturates the component
+        before it applies any motion bias, as the driver's
+        clamp_motion_command does (config/command_limits.yaml).
+
+legacy_bag_audit:
+  confidence: measured
+  source: >
+    bags_x3.zip: 5 ROS 2 Humble sqlite3 bags, about 62 minutes and 425,513
+    messages, recorded with the vendor software stack that physical_rosmaster
+    has since replaced. The archive is untracked (see .gitignore). Regenerate
+    with scripts/real_robot_bag_analyzer.py, which reads only this bag format.
+  bags:
+    bag_x3_5: {description: Mapping run, duration_s: 965.9, message_count: 110507, motion_valid: false}
+    bag_x3_6: {description: Mapping run, duration_s: 802.2, message_count: 93002, motion_valid: true}
+    bag_x3_7: {description: Mapping run, duration_s: 895.7, message_count: 104934, motion_valid: true}
+    bag_x3_8_cones: {description: Blue and red cones course, duration_s: 531.1, message_count: 58900, motion_valid: true}
+    bag_x3_9_obstacles: {description: Cones and obstacles course, duration_s: 548.0, message_count: 58170, motion_valid: true}
+  bag_x3_5_note: >
+    Odometry path length is exactly zero and the IMU is constant for the whole
+    bag while /cmd_vel and /scan keep changing. Excluded from every motion and
+    noise statistic.
+
+  # Kept: nothing newer measures these.
+  cmd_vel:
+    rate_hz: {min: 41.2, max: 62.8}
+    observed_p90: {linear_x: 0.2, linear_y: 0.18, angular_z: 1.0}
+    note: Rate varies by bag and source (teleop or autonomous driving); no header.
+  command_response:
+    confidence: manual_audit
+    method: >
+      Stable command-window segmentation: windows where /cmd_vel held a
+      constant single-axis value, then the steady-state median of the reported
+      /odom twist on that axis. Not reproduced by real_robot_bag_analyzer.py.
+      It describes the vendor estimator's reported behavior, not true motion:
+      the bags have no ground truth.
+    samples:
+      - {cmd_vx: 0.1, reported_vx: 0.0957}
+      - {cmd_vx: 0.2, reported_vx: 0.1896}
+      - {cmd_vx: 0.3, reported_vx: 0.2906}
+      - {cmd_vx: -0.1, reported_vx: -0.0727}
+      - {cmd_vx: -0.2, reported_vx: -0.1776}
+      - {cmd_wz: 1.0, reported_wz: 0.685}
+      - {cmd_wz: -1.0, reported_wz: -0.507}
+      - {cmd_vy: [0.1, -0.1], reported_vy: ~0.0}
+  calibration_gaps:
+    confidence: absent
+    missing:
+      - independent external pose (map, world, mocap, AprilTag or GPS)
+    resolved:
+      - >
+        Wheel encoder feedback: /joint_states now reports real positions and
+        velocities (physical.joint_states), so the bags' "always zero"
+        placeholder no longer applies.
+    blocks:
+      - true longitudinal or lateral slip
+      - per-wheel traction differences
+      - true endpoint or trajectory error
+      - a defensible mu, mu2, slip1 or slip2 for the Gazebo stress profile
+    tracked_in: >
+      #17 (drivetrain and rotation calibration), blocked on
+      AIRclub-UdeSA/physical_rosmaster#35 and #36.
+
+  # Superseded: a newer physical measurement or configuration replaced each of
+  # these. Keep them for history only.
+  superseded:
+    base_footprint_to_base_link_z_m:
+      value: 0.0815
+      superseded_by: physical.frames.base_footprint_to_base_link_z_m
+      note: >
+        From the pre-PR-#31 physical description recorded in the bags. Its
+        camera would sit 119.1 mm above the floor; the tape measured 105-109.
+    joint_states:
+      value: {names: [front_right_joint, front_left_joint, back_right_joint, back_left_joint], position: always_zero, velocity: never_reported}
+      superseded_by: physical.joint_states
+    odom_covariance:
+      value: {pose_xx_yy: 0.000854, pose_yawyaw: 0.000648, behavior: dynamic}
+      superseded_by: physical.odometry
+      note: >
+        The vendor estimator also reported near-zero lateral twist while
+        strafing. The current base_node_X3 computes odometry from the wheel
+        encoders instead; lateral twist has not been re-measured.
+    scan_rate_hz:
+      value: 7.40
+      superseded_by: physical.topics./scan.rate_hz
+    imu_stationary_noise:
+      value: {gyro_xy_rad_s: [0.0075, 0.0121], gyro_z_rad_s: [0.0184, 0.0263], accel_mps2: [0.15, 0.31]}
+      superseded_by: physical.imu.gyro_noise_stddev_rad_s
+      note: Upper bounds from low-motion windows, not a controlled capture.
+    imu_gravity_magnitude_mps2:
+      value: [9.800, 9.848]
+      superseded_by: physical.imu.gravity_magnitude_mps2
+    camera:
+      value: {topics: [/image_raw, /camera_info], frame_id: default_cam, encoding: yuv422_yuy2, dimensions: [320, 240], rate_hz: 10.0, k_matrix: all_zero}
+      superseded_by: physical.camera
+      note: The vendor UVC camera node; physical_rosmaster now publishes the Astra RGB-D contract.
+    wheel_and_sensor_geometry:
+      value: {wheel_x_offset_m: 0.08, wheel_y_offset_m: [-0.0845, 0.084492], camera_link_xyz: [0.057105, 0.0000179, 0.03755]}
+      superseded_by: physical.frames.mounts

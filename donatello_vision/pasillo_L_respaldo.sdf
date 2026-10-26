@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<sdf version="1.8">
+<model name="pasillo_L">
+<static>true</static>
+<link name="izquierda"><pose>0.5 0.75 0.2 0 0 0</pose><collision name="collision"><geometry><box><size>2 0.15 0.4</size></box></geometry></collision><visual name="visual"><geometry><box><size>2 0.15 0.4</size></box></geometry><material><ambient>1 0 0 1</ambient><diffuse>1 0 0 1</diffuse></material></visual></link>
+<link name="derecha_inicio"><pose>-0.5 -0.75 0.2 0 0 0</pose><collision name="collision"><geometry><box><size>2 0.15 0.4</size></box></geometry></collision><visual name="visual"><geometry><box><size>2 0.15 0.4</size></box></geometry><material><ambient>1 0 0 1</ambient><diffuse>1 0 0 1</diffuse></material></visual></link>
+<link name="esquina_exterior"><pose>1.575 -1.75 0.2 0 0 0</pose><collision name="collision"><geometry><box><size>0.15 2 0.4</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.15 2 0.4</size></box></geometry><material><ambient>1 0 0 1</ambient><diffuse>1 0 0 1</diffuse></material></visual></link>
+<link name="esquina_interior"><pose>-0.075 -2.75 0.2 0 0 0</pose><collision name="collision"><geometry><box><size>0.15 2 0.4</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.15 2 0.4</size></box></geometry><material><ambient>1 0 0 1</ambient><diffuse>1 0 0 1</diffuse></material></visual></link>
+</model>
+</sdf>

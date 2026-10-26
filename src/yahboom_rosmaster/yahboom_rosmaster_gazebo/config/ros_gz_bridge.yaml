@@ -1,0 +1,67 @@
+# MecanumDrive command input. /cmd_vel_gz is an internal watchdog output;
+# public commands continue to use /cmd_vel.
+- ros_topic_name: "cmd_vel_gz"
+  gz_topic_name: "/model/rosmaster_x3/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "gz.msgs.Twist"
+  direction: ROS_TO_GZ
+  lazy: false
+
+# RGBD Camera topics. Neither parameter_bridge nor image_bridge in this
+# ros_gz release can publish Best Effort, so these land on private /internal/
+# names; sensor_qos_relay.py republishes the camera_info topics under the public
+# contract topics at Best Effort to match the physical robot's
+# qos_profile_sensor_data. Gazebo's own point cloud is not bridged at all:
+# camera_adapter.py builds the public cloud from the images and camera_info,
+# as the physical robot's adapter does. It reads the color camera_info below.
+- ros_topic_name: "/internal/cam_1/color/camera_info"
+  gz_topic_name: "/cam_1/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+  # Keep calibration available while RViz switches between RGB and depth.
+  # Lazy aliases of the same Gazebo topic can race during display reconfiguration.
+  lazy: false
+
+- ros_topic_name: "/internal/cam_1/depth/camera_info"
+  gz_topic_name: "/cam_1/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+  lazy: false
+
+# LIDAR configuration. Bridged privately for the same Best Effort reason as
+# the camera topics above; sensor_qos_relay.py republishes the public /scan.
+- ros_topic_name: "/internal/scan"
+  gz_topic_name: "scan"
+  ros_type_name: "sensor_msgs/msg/LaserScan"
+  gz_type_name: "gz.msgs.LaserScan"
+  direction: GZ_TO_ROS
+  lazy: false
+
+# IMU. Bridged privately: imu_raw_relay.py turns it into /imu/data_raw with
+# exactly the content the physical driver publishes there (no orientation, no
+# covariances), and imu_filter_madgwick produces /imu/data from that.
+- ros_topic_name: "/internal/imu/data_raw"
+  gz_topic_name: "imu/data"
+  ros_type_name: "sensor_msgs/msg/Imu"
+  gz_type_name: "gz.msgs.IMU"
+  direction: GZ_TO_ROS
+  lazy: false
+
+# Simulation clock for every ROS node using use_sim_time.
+- ros_topic_name: "clock"
+  gz_topic_name: "/clock"
+  ros_type_name: "rosgraph_msgs/msg/Clock"
+  gz_type_name: "gz.msgs.Clock"
+  direction: GZ_TO_ROS
+  lazy: false
+
+# Measurement-only Gazebo world pose. Keep it separate from wheel-derived
+# /odom and do not bridge the plugin's Pose_V output into /tf.
+- ros_topic_name: "ground_truth/odom"
+  gz_topic_name: "/model/rosmaster_x3/ground_truth"
+  ros_type_name: "nav_msgs/msg/Odometry"
+  gz_type_name: "gz.msgs.Odometry"
+  direction: GZ_TO_ROS
+  lazy: false

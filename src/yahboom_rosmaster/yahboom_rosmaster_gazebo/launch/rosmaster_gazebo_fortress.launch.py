@@ -1,0 +1,1040 @@
+#!/usr/bin/env python3
+"""
+Launch Gazebo Fortress simulation for ROSMASTER X3 with physics-based mecanum drive.
+
+Uses the native Gazebo MecanumDrive system for wheel velocity commands, with
+gz_ros2_control kept read-only for joint states and wheel-link TF.
+"""
+import math
+import os
+import platform
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ElementTree
+
+import yaml
+
+from launch import LaunchDescription
+from launch.actions import (
+    AppendEnvironmentVariable,
+    DeclareLaunchArgument,
+    ExecuteProcess,
+    LogInfo,
+    RegisterEventHandler,
+    SetEnvironmentVariable,
+    TimerAction,
+    OpaqueFunction,
+)
+from launch.conditions import IfCondition, UnlessCondition
+from launch.event_handlers import OnProcessExit, OnShutdown
+from launch.logging import get_logger
+from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+
+
+MOTION_PROFILE_KEYS = (
+    "wheel_mu",
+    "wheel_mu2",
+    "wheel_slip2",
+    "front_left_slip1",
+    "front_right_slip1",
+    "back_left_slip1",
+    "back_right_slip1",
+)
+
+# Software rendering can take several seconds to join Gazebo's sensor threads
+# after /server_control acknowledges a clean stop. Keep the launch shutdown
+# callback bounded, but leave enough time for llvmpipe to finish. If it still
+# hasn't exited by the deadline, force-kill it (see _kill_gazebo_server) rather
+# than letting launch's default SIGINT land on a stop that may still be
+# in-flight, which can race SensorsPrivate::Stop.
+GAZEBO_CLEAN_STOP_TIMEOUT = 10.0
+PROCESS_STOP_POLL_INTERVAL = 0.05
+# Time for a sensor frame already being rendered when the world pauses to
+# finish; a 30 Hz RGB-D frame under software rendering takes up to about 0.1 s.
+GAZEBO_PAUSE_SETTLE = 0.5
+# Time Gazebo gets to come up before the transport bridges and relays start.
+# They need Gazebo but not the robot, so they do not wait for the spawn.
+BRIDGE_START_DELAY = 5.0
+
+
+def _load_motion_profile(config_path, profile_name):
+    """Load and validate one deterministic wheel-contact profile."""
+    with open(config_path, encoding="utf-8") as profile_file:
+        document = yaml.safe_load(profile_file)
+
+    profiles = document.get("profiles", {}) if isinstance(document, dict) else {}
+    if profile_name not in profiles:
+        available = ", ".join(sorted(profiles)) or "none"
+        raise RuntimeError(
+            f"Unknown motion profile '{profile_name}'; available profiles: {available}")
+
+    profile = profiles[profile_name]
+    missing = [key for key in MOTION_PROFILE_KEYS if key not in profile]
+    extra = [key for key in profile if key not in MOTION_PROFILE_KEYS]
+    if missing or extra:
+        raise RuntimeError(
+            f"Invalid motion profile '{profile_name}': "
+            f"missing={missing}, extra={extra}")
+
+    values = {}
+    for key in MOTION_PROFILE_KEYS:
+        try:
+            values[key] = float(profile[key])
+        except (TypeError, ValueError) as exception:
+            raise RuntimeError(
+                f"Motion profile '{profile_name}' value '{key}' must be numeric") \
+                from exception
+        if values[key] < 0.0:
+            raise RuntimeError(
+                f"Motion profile '{profile_name}' value '{key}' must be non-negative")
+    return values
+
+
+def _spawn_pose_arguments(context):
+    """Return ros_gz_sim create flags for the requested world-frame start pose."""
+    flags = []
+    for argument, flag in (
+            ("spawn_x", "-x"), ("spawn_y", "-y"), ("spawn_yaw", "-Y")):
+        raw = LaunchConfiguration(argument).perform(context)
+        try:
+            value = float(raw)
+        except ValueError as error:
+            raise ValueError(
+                f"{argument} must be a number (meters, or radians for "
+                f"spawn_yaw), got {raw!r}") from error
+        if not math.isfinite(value):
+            raise ValueError(f"{argument} must be finite, got {raw!r}")
+        flags.extend([flag, repr(value)])
+    return flags
+
+
+def _after_spawn_actions(event, actions):
+    """Return the actions to launch once the spawn request has exited."""
+    if event.returncode:
+        get_logger("rosmaster_gazebo_spawn").warning(
+            f"Spawning the robot exited with code {event.returncode}; starting "
+            "the controller and odometry nodes anyway. The create output above "
+            "shows why it failed")
+    return actions
+
+
+def _launch_robot(context, xacro_path, profile_config, after_spawn):
+    """
+    Expand the selected motion profile once for RSP and Gazebo spawn.
+
+    ``after_spawn`` lists the actions that need the spawned robot, and are
+    launched as soon as the spawn request has exited.
+    """
+    profile_name = LaunchConfiguration("motion_profile").perform(context)
+    profile = _load_motion_profile(profile_config, profile_name)
+    render_sensors = LaunchConfiguration("render_sensors").perform(context)
+    if render_sensors.lower() not in ("true", "1", "yes"):
+        get_logger("rosmaster_gazebo_render_sensors").warning(
+            "Rendering sensors (LiDAR, RGB-D camera) are disabled; /scan and "
+            "/cam_1 topics will stay silent")
+    command = [
+        "xacro", xacro_path,
+        "use_gazebo:=true",
+        "robot_name:=rosmaster_x3",
+        "prefix:=",
+        f"render_sensors:={render_sensors}",
+        f"use_ros2_control:={LaunchConfiguration('use_ros2_control').perform(context)}",
+    ]
+    command.extend(f"{key}:={profile[key]}" for key in MOTION_PROFILE_KEYS)
+
+    # The IMU's per-axis noise is fixed in the SDF when Gazebo loads the sensor,
+    # so the sensor profile reaches it as xacro arguments, as the motion profile
+    # does: zeros under `ideal`, the physical capture under `physical`.
+    pkg_gz = get_package_share_directory("yahboom_rosmaster_gazebo")
+    sys.path.insert(0, os.path.join(pkg_gz, "scripts"))
+    from sensor_profiles import imu_xacro_arguments, load_sensor_profile
+    sensor_profile_name = LaunchConfiguration("sensor_profile").perform(context)
+    imu_profile = load_sensor_profile(
+        os.path.join(pkg_gz, "config", "sensor_profiles.yaml"), "imu",
+        sensor_profile_name)
+    command.extend(
+        f"{name}:={value}" for name, value in imu_xacro_arguments(imu_profile).items())
+    robot_description = subprocess.check_output(command, text=True)
+
+    get_logger("rosmaster_gazebo_motion_profile").info(
+        f"Using '{profile_name}' wheel-contact profile from {profile_config}")
+
+    use_sim_time = LaunchConfiguration("use_sim_time").perform(context)
+    robot_state_publisher = Node(
+        package="robot_state_publisher",
+        executable="robot_state_publisher",
+        output="screen",
+        parameters=[{
+            "use_sim_time": use_sim_time.lower() in ("true", "1", "yes"),
+            "robot_description": robot_description,
+        }],
+    )
+    spawn = Node(
+        package="ros_gz_sim",
+        executable="create",
+        arguments=[
+            "-string", robot_description,
+            "-name", "rosmaster_x3",
+            # base_footprint is on the floor, so the default z=0 spawn rests
+            # the wheels on the ground. Only the planar pose is configurable.
+            *_spawn_pose_arguments(context),
+        ],
+        output="screen",
+    )
+    return [
+        # RSP starts after /clock is available, avoiding wall-clock TF poisoning.
+        TimerAction(period=2.0, actions=[robot_state_publisher]),
+        # The nodes that need the robot wait for the spawn request to exit
+        # instead of for a fixed delay. gz_ros2_control creates the controller
+        # manager with the robot, and the controller spawner waits for its
+        # service, so they need no safety margin on top. A failed spawn is
+        # logged but still launches them, as the timers did.
+        RegisterEventHandler(OnProcessExit(
+            target_action=spawn,
+            on_exit=lambda event, context: _after_spawn_actions(
+                event, after_spawn))),
+        # Spawn from the same expanded string. The create node never subscribes
+        # to robot_description, preventing stale transient-local double spawns.
+        TimerAction(period=3.0, actions=[spawn]),
+    ]
+
+
+def _camera_adapter(context, pkg_gz):
+    """Start the camera adapter with the selected sensor profile and cloud options."""
+    # The loader lives with the scripts, so that its unit tests can import it.
+    # It is imported here, once the launch is running, rather than at load.
+    sys.path.insert(0, os.path.join(pkg_gz, "scripts"))
+    from sensor_profiles import (
+        depth_parameters,
+        load_sensor_profile,
+        point_cloud_parameters,
+    )
+
+    profile_config = os.path.join(pkg_gz, "config", "sensor_profiles.yaml")
+    profile_name = LaunchConfiguration("sensor_profile").perform(context)
+    profile = load_sensor_profile(profile_config, "point_cloud", profile_name)
+    depth_profile = load_sensor_profile(profile_config, "depth", profile_name)
+
+    decimation = LaunchConfiguration("cloud_decimation").perform(context)
+    seed = LaunchConfiguration("sensor_seed").perform(context)
+    try:
+        decimation, seed = int(decimation), int(seed)
+    except ValueError as exception:
+        raise RuntimeError(
+            f"cloud_decimation ({decimation!r}) and sensor_seed ({seed!r}) "
+            "must be integers") from exception
+    if decimation < 1:
+        raise RuntimeError(f"cloud_decimation must be at least 1, got {decimation}")
+
+    get_logger("rosmaster_gazebo_sensor_profile").info(
+        f"Using '{profile_name}' sensor profile from {profile_config}")
+
+    render_sensors = LaunchConfiguration("render_sensors")
+    use_sim_time = LaunchConfiguration("use_sim_time").perform(context)
+    camera_adapter = Node(
+        package="yahboom_rosmaster_gazebo",
+        executable="camera_adapter.py",
+        name="camera_adapter",
+        output="screen",
+        parameters=[{
+            "use_sim_time": use_sim_time.lower() in ("true", "1", "yes"),
+            "cloud_decimation": decimation,
+            "cloud_strip_nan": LaunchConfiguration("cloud_strip_nan").perform(
+                context).lower() in ("true", "1", "yes"),
+            "seed": seed,
+            **point_cloud_parameters(profile),
+            **depth_parameters(depth_profile),
+        }],
+        # The adapter does its arithmetic element-wise. Should any call reach
+        # BLAS, its spinning threads would take cores from the Gazebo server:
+        # in #49 a multithreaded product took 8.5 cores and cut the real-time
+        # factor to 0.77.
+        additional_env={"OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"},
+        condition=IfCondition(render_sensors),
+    )
+    return [camera_adapter]
+
+
+def _scan_relay(context, pkg_gz):
+    """Start the /scan relay with the selected LiDAR profile: its delay and scan_time."""
+    sys.path.insert(0, os.path.join(pkg_gz, "scripts"))
+    from sensor_profiles import lidar_parameters, load_sensor_profile
+
+    profile = load_sensor_profile(
+        os.path.join(pkg_gz, "config", "sensor_profiles.yaml"), "lidar",
+        LaunchConfiguration("sensor_profile").perform(context))
+    return [Node(
+        package="yahboom_rosmaster_gazebo",
+        executable="sensor_qos_relay.py",
+        name="scan_qos_relay",
+        output="screen",
+        parameters=[{
+            "msg_type": "LaserScan",
+            "input_topic": "/internal/scan",
+            "output_topic": "/scan",
+            **lidar_parameters(profile),
+        }],
+    )]
+
+
+def _rviz_config_for_platform(default_rviz):
+    """
+    Return an RViz config the host can actually open.
+
+    The Camera display builds a second OGRE render panel, which aborts RViz on
+    macOS with "mutex lock failed". macOS has no simulated camera anyway, so
+    drop that one display and keep a single config as the source of truth.
+    """
+    if platform.system() != "Darwin":
+        return default_rviz
+
+    with open(default_rviz, encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file)
+
+    displays = config.get("Visualization Manager", {}).get("Displays", [])
+    config["Visualization Manager"]["Displays"] = [
+        display for display in displays
+        if display.get("Class") != "rviz_default_plugins/Camera"
+    ]
+
+    patched = os.path.join(tempfile.gettempdir(), "rosmaster_gazebo_macos.rviz")
+    with open(patched, "w", encoding="utf-8") as config_file:
+        yaml.safe_dump(config, config_file, sort_keys=False)
+    return patched
+
+
+def _launch_rviz(context):
+    launch_rviz = context.launch_configurations.get("rviz", "true")
+    if launch_rviz.lower() in ("true", "1", "yes"):
+        pkg_gz = get_package_share_directory("yahboom_rosmaster_gazebo")
+        default_rviz = _rviz_config_for_platform(
+            os.path.join(pkg_gz, "rviz", "gazebo.rviz"))
+        use_sim_time = context.launch_configurations.get("use_sim_time", "true")
+        rviz_node = Node(
+            package="rviz2",
+            executable="rviz2",
+            arguments=["-d", default_rviz],
+            parameters=[{"use_sim_time": use_sim_time == "true"}],
+            output="screen",
+        )
+        return [TimerAction(period=5.0, actions=[rviz_node])]
+    return []
+
+
+def _process_stopped(process):
+    """
+    Return whether an owned launch process has actually been reaped.
+
+    A zombie (state ``Z``) does NOT count as stopped here. For a
+    multi-threaded process, /proc reports state Z as soon as the leading
+    thread exits -- typically 66-85 ms before the kernel can actually reap
+    the process and drop its /proc/<pid> entry. Treating Z as "stopped" let
+    this function's caller return early, so launch's own SIGINT dispatch
+    (``Popen.send_signal``, which on Python 3.10 first calls ``poll()``,
+    i.e. ``waitpid(WNOHANG)``) could win a race against asyncio's
+    ThreadedChildWatcher thread and reap the child itself. When launch won
+    that race, the watcher thread's own waitpid got ECHILD and asyncio
+    fabricated an exit code of 255, even though the process (Gazebo) had
+    actually exited 0 (see issue #31; #50 fixed an earlier problem on this
+    same shutdown path). Waiting for /proc/<pid> to vanish entirely instead
+    lets the watcher thread reap the child first while this function's
+    caller blocks the event loop in its polling sleep; launch's later
+    ``poll()`` then lands on an already-reaped child, gets ECHILD, and
+    ``Popen`` handles that without re-signalling.
+
+    This relies on Humble's default asyncio child watcher (Python 3.10's
+    ThreadedChildWatcher) reaping children from its own thread while this
+    function is polled from a loop that blocks the event loop. If a future
+    watcher only reaps children when the event loop itself gets to run,
+    that assumption breaks -- but the effect is simply that the wait runs
+    out its existing timeout and the caller force-kills the process as it
+    already does for any other stall, so this fails safe instead of
+    hanging forever.
+    """
+    if process.return_code is not None:
+        return True
+    details = process.process_details
+    if details is None or "pid" not in details:
+        return False
+    try:
+        with open(f"/proc/{details['pid']}/stat", encoding="utf-8"):
+            pass
+    except FileNotFoundError:
+        # Linux exposes both live and zombie processes in /proc, so a
+        # missing entry means the process has actually been reaped.
+        # Platforms such as macOS do not mount /proc at all, so probe the
+        # PID there instead of mistaking every running process for one
+        # that has already exited.
+        if os.path.isdir("/proc"):
+            return True
+        try:
+            os.kill(details["pid"], 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+    except OSError:
+        return False
+    # /proc/<pid> still exists: the process is either still running or is a
+    # zombie awaiting reap. Either way, it has not actually stopped yet.
+    return False
+
+
+def _wait_for_process_stop(
+        process, timeout, poll_interval=PROCESS_STOP_POLL_INTERVAL):
+    """Wait at most ``timeout`` seconds for an owned process to stop."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        if _process_stopped(process):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        time.sleep(min(poll_interval, remaining))
+
+
+def _stop_bridge_process(process, label, logger, timeout=2.0):
+    """
+    Stop a transport-bridge consumer before its Gazebo publishers disappear.
+
+    ros_gz bridge processes (parameter_bridge, image_bridge) can segfault
+    during their own SIGINT teardown if Gazebo's transport node vanishes out
+    from under them mid-shutdown. Stopping them while Gazebo is still up
+    avoids that race.
+
+    The caller pauses the world first (see _request_gazebo_stop). image_bridge
+    has a second race of its own (issue #55): its main() destroys the handlers,
+    and with them the ROS publishers, before the Gazebo transport node, while
+    the transport's receive thread can still be inside a callback bound to a
+    handler by a raw pointer. A camera frame arriving in that window crashes
+    Publisher::publish (SIGSEGV). A paused world sends no frames, so with the
+    world paused first nothing is in flight when the bridge gets its SIGINT.
+    """
+    if _process_stopped(process):
+        return
+
+    details = process.process_details
+    if details is None or "pid" not in details:
+        logger.debug(f"{label} was not started before shutdown")
+        return
+
+    try:
+        logger.info(f"Stopping the {label} before Gazebo sensor shutdown")
+        os.kill(details["pid"], signal.SIGINT)
+    except ProcessLookupError:
+        return
+    except OSError as exception:
+        logger.warning(f"Could not stop the {label} before Gazebo: {exception}")
+        return
+
+    if _wait_for_process_stop(process, timeout):
+        logger.info(f"{label} stopped before Gazebo sensor shutdown")
+        return
+    logger.warning(
+        f"{label} did not stop within {timeout:.1f} seconds; continuing "
+        "with Gazebo shutdown and launch signal fallback")
+
+
+def _kill_gazebo_server(gazebo_server, logger):
+    """
+    Force-kill Gazebo after its service-requested stop stalls.
+
+    SIGINT is caught by ign gazebo's own handler and re-enters
+    Server::Stop() -> SensorsPrivate::Stop(), which can join the render
+    thread a second time while the service-triggered stop is still joining
+    it, an observed cause of the SIGSEGV in CI (see issue #31). SIGKILL
+    bypasses that handler entirely, so it cannot re-enter the same path.
+    """
+    if _process_stopped(gazebo_server):
+        return
+    details = gazebo_server.process_details
+    if details is None or "pid" not in details:
+        return
+    try:
+        os.kill(details["pid"], signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError as exception:
+        logger.warning(f"Could not force-kill Gazebo: {exception}")
+
+
+def _world_name(world_path):
+    """Return the name of the world in an SDF file, or None if unreadable."""
+    try:
+        world = ElementTree.parse(world_path).getroot().find("world")
+    except (OSError, ElementTree.ParseError):
+        return None
+    return None if world is None else world.get("name")
+
+
+def _pause_gazebo(ign_executable, world_name, context, logger):
+    """
+    Pause the world so the sensor render thread is idle when Gazebo stops.
+
+    Gazebo emits its Stop event from a helper thread when /server_control asks
+    it to stop. The Sensors system's handler disconnects itself and joins the
+    render thread inside that emit, while the main thread, already out of its
+    run loop, emits Stop again as the server is destroyed. The two emits are
+    not synchronised and can segfault the server (exit -11, as in #31). The
+    join is only slow when a frame is being rendered, which a 30 Hz camera
+    under software rendering makes common. A paused world starts no new sensor
+    frames, so once the current one finishes the join returns at once.
+
+    The same pause also silences the camera before the bridges are stopped,
+    which closes the image_bridge shutdown race (issue #55).
+
+    Return True when Gazebo acknowledged the pause and it has settled.
+    """
+    if world_name is None:
+        logger.warning("Cannot pause Gazebo before stopping: unknown world name")
+        return False
+    try:
+        result = subprocess.run(
+            [
+                ign_executable,
+                "service",
+                "-s", f"/world/{world_name}/control",
+                "--reqtype", "ignition.msgs.WorldControl",
+                "--reptype", "ignition.msgs.Boolean",
+                "--timeout", "1500",
+                "--req", "pause: true",
+            ],
+            capture_output=True,
+            check=False,
+            env=context.environment,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exception:
+        logger.warning(f"Could not pause Gazebo before stopping it: {exception}")
+        return False
+    if result.returncode != 0 or "data: true" not in result.stdout:
+        detail = result.stderr.strip() or result.stdout.strip() or "no response"
+        logger.warning(f"Gazebo did not acknowledge the pause request: {detail}")
+        return False
+    time.sleep(GAZEBO_PAUSE_SETTLE)
+    logger.info("Paused Gazebo before stopping it")
+    return True
+
+
+def _request_gazebo_stop(
+        event, context, gazebo_server, world_name, image_bridge, parameter_bridge):
+    """
+    Pause the world, stop the transport consumers, then Gazebo.
+
+    The pause comes first so that no camera frame is in flight when the image
+    bridge gets its SIGINT (issue #55). If the world cannot be paused (no
+    readable world name, no `ign`, or no acknowledgement) the bridges are
+    still stopped, with the world running, as before this ordering.
+    """
+    del event
+    logger = get_logger("rosmaster_gazebo_shutdown")
+
+    ign_executable = shutil.which("ign")
+    paused = False
+    if ign_executable is None:
+        logger.warning("Cannot pause or stop Gazebo: 'ign' is not available")
+    else:
+        paused = _pause_gazebo(ign_executable, world_name, context, logger)
+    if not paused:
+        logger.warning(
+            "Stopping the bridges with the world still running; the image "
+            "bridge can crash if a camera frame arrives while it shuts down")
+
+    _stop_bridge_process(image_bridge, "image bridge", logger)
+    _stop_bridge_process(parameter_bridge, "parameter bridge", logger)
+
+    if ign_executable is None:
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                ign_executable,
+                "service",
+                "-s", "/server_control",
+                "--reqtype", "ignition.msgs.ServerControl",
+                "--reptype", "ignition.msgs.Boolean",
+                "--timeout", "1500",
+                "--req", "stop: true",
+            ],
+            capture_output=True,
+            check=False,
+            env=context.environment,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exception:
+        logger.warning(
+            f"Gazebo stop service was unavailable; using signal fallback: {exception}")
+        return None
+
+    if result.returncode != 0 or "data: true" not in result.stdout:
+        detail = result.stderr.strip() or result.stdout.strip() or "no response"
+        logger.warning(
+            "Gazebo did not acknowledge the stop service; using signal fallback: "
+            f"{detail}")
+    else:
+        logger.info("Gazebo acknowledged the clean stop request")
+        if _wait_for_process_stop(
+                gazebo_server, GAZEBO_CLEAN_STOP_TIMEOUT):
+            logger.info("Gazebo completed its clean stop before signal fallback")
+        else:
+            logger.warning(
+                "Gazebo did not finish its service-requested stop within "
+                f"{GAZEBO_CLEAN_STOP_TIMEOUT:.0f} seconds; force-killing it "
+                "instead of signaling, since SIGINT would re-enter its "
+                "still-in-flight stop and can race SensorsPrivate::Stop")
+            _kill_gazebo_server(gazebo_server, logger)
+    return None
+
+
+def _launch_gazebo_server(context, ign_executable, pkg_gz, image_bridge, parameter_bridge):
+    raw_world = LaunchConfiguration("world").perform(context)
+    if os.path.isabs(raw_world) and os.path.exists(raw_world):
+        world_path = raw_world
+    else:
+        candidate = os.path.join(pkg_gz, "worlds", raw_world)
+        if os.path.exists(candidate):
+            world_path = candidate
+        else:
+            candidate_ext = os.path.join(pkg_gz, "worlds", f"{raw_world}.world")
+            if os.path.exists(candidate_ext):
+                world_path = candidate_ext
+            else:
+                world_path = raw_world
+
+    get_logger("rosmaster_gazebo_server").info(f"Loading Gazebo world from: {world_path}")
+
+    gazebo_server = ExecuteProcess(
+        cmd=[
+            "ruby", ign_executable, "gazebo",
+            "-r", "-s", "-v", "4", world_path,
+            "--force-version", "6",
+        ],
+        output="screen",
+    )
+    world_name = _world_name(world_path)
+    return [
+        RegisterEventHandler(OnShutdown(
+            on_shutdown=lambda event, ctx: _request_gazebo_stop(
+                event, ctx, gazebo_server, world_name, image_bridge,
+                parameter_bridge))),
+        gazebo_server,
+    ]
+
+
+def generate_launch_description():
+    pkg_desc = get_package_share_directory("yahboom_rosmaster_description")
+    pkg_gz = get_package_share_directory("yahboom_rosmaster_gazebo")
+    ign_executable = shutil.which("ign")
+    if ign_executable is None:
+        raise RuntimeError("Could not find the Gazebo Fortress 'ign' executable")
+
+    default_world = os.path.join(pkg_gz, "worlds", "empty.world")
+    default_xacro = os.path.join(pkg_desc, "urdf", "robots", "rosmaster_x3.urdf.xacro")
+    bridge_config = os.path.join(pkg_gz, "config", "ros_gz_bridge.yaml")
+    motion_profile_config = os.path.join(pkg_gz, "config", "motion_profiles.yaml")
+    motion_bias_config = os.path.join(pkg_gz, "config", "motion_bias.yaml")
+    wheel_odometry_script = os.path.join(pkg_gz, "scripts", "wheel_state_odometry.py")
+
+    declare_use_sim_time = DeclareLaunchArgument(
+        "use_sim_time", default_value="true", description="Use simulation clock")
+    declare_world = DeclareLaunchArgument("world", default_value=default_world)
+    declare_rviz = DeclareLaunchArgument(
+        "rviz", default_value="true", description="Launch RViz (true/false)")
+    declare_gui = DeclareLaunchArgument(
+        "gui", default_value="true", description="Launch Gazebo GUI client (true/false)")
+    declare_headless = DeclareLaunchArgument(
+        "headless", default_value="false",
+        description="Skip Gazebo GUI client — server-only for autonomous/CI debugging")
+    # The Gazebo Fortress server initialises ogre2 on its own render thread,
+    # which macOS forbids (NSWindow is main-thread only) and which segfaults the
+    # server as soon as a gpu_lidar or rgbd_camera spawns. Default those sensors
+    # off on macOS so the rest of the simulation runs.
+    declare_render_sensors = DeclareLaunchArgument(
+        "render_sensors",
+        default_value="false" if platform.system() == "Darwin" else "true",
+        choices=["true", "false"],
+        description=(
+            "Spawn the rendering sensors (LiDAR, RGB-D camera). Unsupported by "
+            "the Gazebo Fortress server on macOS"),
+    )
+    # Activating a controller calls ControllerManager::switch_controller, which
+    # waits on a condition variable holding a deferred (unlocked) mutex. libc++
+    # raises EPERM there inside a noexcept function, so the Gazebo server
+    # aborts. Publish joint state directly from Gazebo on macOS instead.
+    declare_use_ros2_control = DeclareLaunchArgument(
+        "use_ros2_control",
+        default_value="false" if platform.system() == "Darwin" else "true",
+        choices=["true", "false"],
+        description=(
+            "Use gz_ros2_control for joint state. When false, Gazebo's "
+            "JointStatePublisher feeds /joint_states through ros_gz_bridge"),
+    )
+    declare_motion_bias = DeclareLaunchArgument(
+        "motion_bias",
+        default_value="true",
+        description=(
+            "Add the per-direction drift of an uncalibrated mecanum base to "
+            "/cmd_vel. Resampled at random per launch, so switch it off for "
+            "tests that assert an exact trajectory"),
+    )
+    declare_motion_profile = DeclareLaunchArgument(
+        "motion_profile",
+        default_value="stress",
+        choices=["ideal", "stress"],
+        description=(
+            "Wheel-contact profile: stress is deterministic and uncalibrated; "
+            "ideal preserves the zero-slip baseline"),
+    )
+    declare_spawn_x = DeclareLaunchArgument(
+        "spawn_x",
+        default_value="0.0",
+        description="Robot start x in the Gazebo world frame, in meters",
+    )
+    declare_spawn_y = DeclareLaunchArgument(
+        "spawn_y",
+        default_value="0.0",
+        description="Robot start y in the Gazebo world frame, in meters",
+    )
+    declare_spawn_yaw = DeclareLaunchArgument(
+        "spawn_yaw",
+        default_value="0.0",
+        description=(
+            "Robot start heading in the Gazebo world frame, in radians "
+            "(counterclockwise from +x). /odom still starts at zero"),
+    )
+    declare_sensor_profile = DeclareLaunchArgument(
+        "sensor_profile",
+        default_value="physical",
+        choices=["ideal", "physical"],
+        description=(
+            "Sensor quality and timing profile: physical delivers the point "
+            "cloud with the physical X3's gaps and latency, and the depth "
+            "image with its scale error, noise and NaN below 0.6 m; ideal "
+            "delivers every frame as soon as it is built, with the rendered "
+            "depth unchanged"),
+    )
+    declare_sensor_seed = DeclareLaunchArgument(
+        "sensor_seed",
+        default_value="-1",
+        description=(
+            "Seed for the sensor profiles' random draws. -1 picks a random "
+            "one per launch, which the camera adapter logs; tests pass a "
+            "fixed one"),
+    )
+    declare_cloud_strip_nan = DeclareLaunchArgument(
+        "cloud_strip_nan",
+        default_value="true",
+        choices=["true", "false"],
+        description=(
+            "Drop non-finite points from the point cloud, as the physical "
+            "adapter does by default, leaving an unorganized dense cloud; "
+            "false keeps the organized cloud"),
+    )
+    declare_cloud_decimation = DeclareLaunchArgument(
+        "cloud_decimation",
+        default_value="1",
+        description="Keep every Nth row and column of the point cloud",
+    )
+    declare_ground_truth_frame = DeclareLaunchArgument(
+        "ground_truth_frame",
+        default_value="auto",
+        description=(
+            "Diagnostic ground-truth display frame. 'auto' starts in odom and "
+            "captures a fixed map alignment if map->odom appears; use 'odom' "
+            "to disable the automatic SLAM switch"),
+    )
+    headless = LaunchConfiguration("headless")
+    gui = LaunchConfiguration("gui")
+    render_sensors = LaunchConfiguration("render_sensors")
+
+    # Gazebo Fortress GUI — skipped when headless:=true or gui:=false.
+    # QT_QPA_PLATFORM=xcb forces X11/XWayland mode on Wayland sessions;
+    # without it the Qt platform default fails on AMD Wayland, leaving a white window.
+    # The Gazebo GUI cannot run on macOS: ign-gui builds its 3D scene on a
+    # secondary thread, and creating the ogre2 render window there trips the
+    # same NSWindow main-thread rule that blocks rendering sensors. The `ign
+    # gazebo` CLI refuses `-g` there for this reason (gazebosim/gz-sim#44).
+    # Use RViz for visualisation instead.
+    gazebo_client_supported = platform.system() != "Darwin"
+    gazebo_client = ExecuteProcess(
+        cmd=[
+            "ruby", ign_executable, "gazebo", "-g",
+            "--force-version", "6",
+        ],
+        output="screen",
+        condition=UnlessCondition(
+            PythonExpression([
+                "'", headless, "'.lower() in ('true', '1', 'yes') or ",
+                "'", gui, "'.lower() in ('false', '0', 'no')"
+            ])
+        ),
+    ) if gazebo_client_supported else LogInfo(
+        msg="macOS: skipping the Gazebo GUI (unsupported); use RViz to view the robot")
+
+    # Bridge Gazebo command input and sensor topics.
+    ros_gz_bridge = Node(
+        package="ros_gz_bridge",
+        executable="parameter_bridge",
+        parameters=[{"config_file": bridge_config}],
+        output="screen",
+    )
+
+    # Optimized image bridge for the native Fortress RGB-D camera outputs.
+    # image_bridge cannot publish Best Effort, so it lands on private
+    # /internal/ names. The camera adapter builds the public depth image and
+    # point cloud from them, and sensor_qos_relay nodes below republish the
+    # color image and camera_info at Best Effort to match the physical robot.
+    ros_gz_image_bridge = Node(
+        package="ros_gz_image",
+        executable="image_bridge",
+        arguments=["/cam_1/image", "/cam_1/depth_image"],
+        remappings=[
+            ("/cam_1/image", "/internal/cam_1/color/image_raw"),
+            ("/cam_1/depth_image", "/internal/cam_1/depth/image_raw"),
+        ],
+        output="screen",
+        condition=IfCondition(render_sensors),
+    )
+
+    # Best Effort matches the physical robot's qos_profile_sensor_data for
+    # these same topics (yahboomcar_astra, sllidar_ros2), so a consumer built
+    # against one works against the other without remaps or QoS overrides.
+    def _sensor_qos_relay(name, msg_type, input_topic, output_topic, condition=None):
+        return Node(
+            package="yahboom_rosmaster_gazebo",
+            executable="sensor_qos_relay.py",
+            name=name,
+            output="screen",
+            parameters=[{
+                "msg_type": msg_type,
+                "input_topic": input_topic,
+                "output_topic": output_topic,
+            }],
+            condition=condition,
+        )
+
+    color_image_qos_relay = _sensor_qos_relay(
+        "color_image_qos_relay", "Image",
+        "/internal/cam_1/color/image_raw", "/cam_1/color/image_raw",
+        condition=IfCondition(render_sensors))
+    color_camera_info_qos_relay = _sensor_qos_relay(
+        "color_camera_info_qos_relay", "CameraInfo",
+        "/internal/cam_1/color/camera_info", "/cam_1/color/camera_info")
+    depth_camera_info_qos_relay = _sensor_qos_relay(
+        "depth_camera_info_qos_relay", "CameraInfo",
+        "/internal/cam_1/depth/camera_info", "/cam_1/depth/camera_info")
+    # The /scan relay is started by _scan_relay, which applies the sensor profile.
+
+    # /imu/data_raw carries what the physical driver publishes there, and the
+    # stock imu_filter_madgwick node, with the robot's parameters, estimates the
+    # orientation of /imu/data from it. Both run under either sensor profile. The
+    # filter takes its time from the message stamps (dt from the headers), so it
+    # needs no use_sim_time and never subscribes to /clock.
+    imu_raw_relay = Node(
+        package="yahboom_rosmaster_gazebo",
+        executable="imu_raw_relay.py",
+        name="imu_raw_relay",
+        output="screen",
+    )
+    imu_filter = Node(
+        package="imu_filter_madgwick",
+        executable="imu_filter_madgwick_node",
+        output="screen",
+        parameters=[os.path.join(pkg_gz, "config", "imu_filter_madgwick.yaml")],
+    )
+
+    # Load and activate the read-only joint state broadcaster. The spawner waits
+    # longer than `ros2 control load_controller`, which helps GUI starts on busy
+    # machines where the controller manager is late to answer service calls.
+    use_ros2_control = LaunchConfiguration("use_ros2_control")
+
+    load_joint_state_broadcaster = ExecuteProcess(
+        cmd=[
+            "ros2", "run", "controller_manager", "spawner",
+            "joint_state_broadcaster",
+            "--controller-manager", "/controller_manager",
+            "--controller-manager-timeout", "60",
+            "--service-call-timeout", "60",
+        ],
+        output="screen",
+        condition=IfCondition(use_ros2_control),
+    )
+
+    # Stands in for joint_state_broadcaster when ros2_control is disabled.
+    # Gazebo's JointStatePublisher has no rate control and fires every sim step,
+    # so the raw topic arrives near 1 kHz; throttle it to the same 10 Hz
+    # joint_state_broadcaster delivers (the physical driver's rate, #43 step 8a),
+    # which also paces /odom and /tf downstream.
+    joint_state_bridge = Node(
+        package="ros_gz_bridge",
+        executable="parameter_bridge",
+        name="joint_state_bridge",
+        arguments=["/joint_states_gz@sensor_msgs/msg/JointState[ignition.msgs.Model"],
+        remappings=[("/joint_states_gz", "/joint_states_raw")],
+        output="screen",
+        condition=UnlessCondition(use_ros2_control),
+    )
+
+    joint_state_throttle = Node(
+        package="topic_tools",
+        executable="throttle",
+        name="joint_state_throttle",
+        arguments=["messages", "/joint_states_raw", "10.0", "/joint_states"],
+        output="screen",
+        condition=UnlessCondition(use_ros2_control),
+    )
+
+    # Native MecanumDrive has no command timeout in Fortress 6.16, so keep the
+    # public /cmd_vel contract and publish zero to the internal bridge topic when
+    # commands stop. motion_bias_file adds the per-direction drift that makes an
+    # uncalibrated mecanum base behave like the real one; it is resampled on
+    # every launch, so tests asserting an exact trajectory must switch it off.
+    # An empty path is how the watchdog is told to relay unmodified, so the two
+    # variants differ only in that parameter.
+    #
+    # Both variants clamp /cmd_vel first, to the physical driver's limits from
+    # config/command_limits.yaml (#43 step 8a).
+    sys.path.insert(0, os.path.join(pkg_gz, "scripts"))
+    from command_limits import load_command_limits
+    x_limit, y_limit, angular_limit = load_command_limits(
+        os.path.join(pkg_gz, "config", "command_limits.yaml"))
+
+    def _watchdog(bias_file, condition):
+        return Node(
+            package="yahboom_rosmaster_gazebo",
+            executable="cmd_vel_watchdog.py",
+            output="screen",
+            parameters=[{
+                "motion_bias_file": bias_file,
+                "linear_x_limit": x_limit,
+                "linear_y_limit": y_limit,
+                "angular_z_limit": angular_limit,
+            }],
+            condition=condition,
+        )
+
+    # Ideal odometry from the raw /cmd_vel, before any drift is injected, so a
+    # student can see estimated against commanded.
+    calculated_odometry_node = Node(
+        package="yahboom_rosmaster_gazebo",
+        executable="calculated_odometry.py",
+        output="screen",
+        parameters=[{
+            "use_sim_time": LaunchConfiguration("use_sim_time"),
+            "publish_rate": 50.0,
+            "odom_frame_id": "calc_odom",
+            "base_frame_id": "calc_base",
+        }],
+    )
+
+    # A runtime node, not the contract probe. The probe validates and exits, so
+    # launching it here left a process that always exits non-zero and broke
+    # test_all_processes_exit_cleanly in every launch test including this file.
+    # It aligns against odom -> base_footprint, so it is launched with the wheel
+    # odometry that owns that edge.
+    ground_truth_tf_node = Node(
+        package="yahboom_rosmaster_gazebo",
+        executable="ground_truth_tf.py",
+        output="screen",
+        parameters=[{
+            # Wall time: every transform takes its stamp from /ground_truth/odom,
+            # so following the 1 kHz /clock only burned CPU (#75).
+            "use_sim_time": False,
+            "frame_id": LaunchConfiguration("ground_truth_frame"),
+        }],
+    )
+
+    motion_bias = LaunchConfiguration("motion_bias")
+    cmd_vel_watchdog = _watchdog(motion_bias_config, IfCondition(motion_bias))
+    cmd_vel_watchdog_unbiased = _watchdog("", UnlessCondition(motion_bias))
+
+    # Encoder-style odometry from wheel joint states remains separate from the
+    # measurement-only /ground_truth/odom bridge and owns odom->base TF.
+    wheel_state_odometry = ExecuteProcess(
+        cmd=[
+            "python3", wheel_odometry_script,
+            "--ros-args", "--params-file",
+            os.path.join(pkg_gz, "config", "wheel_odometry.yaml"),
+        ],
+        output="screen",
+    )
+
+    # Launched once the robot has been spawned: the controller and the odometry
+    # that consume its joint state. The ground-truth node only starts aligning
+    # when /ground_truth/odom arrives from the bridge, so it may come up first.
+    after_spawn = [
+        load_joint_state_broadcaster,
+        wheel_state_odometry,
+        ground_truth_tf_node,
+    ]
+
+    return LaunchDescription([
+        declare_use_sim_time,
+        declare_world,
+        declare_rviz,
+        declare_gui,
+        declare_headless,
+        declare_render_sensors,
+        declare_use_ros2_control,
+        declare_motion_bias,
+        declare_motion_profile,
+        declare_spawn_x,
+        declare_spawn_y,
+        declare_spawn_yaw,
+        declare_sensor_profile,
+        declare_sensor_seed,
+        declare_cloud_strip_nan,
+        declare_cloud_decimation,
+        declare_ground_truth_frame,
+        # Force X11/XWayland for Gazebo GUI — prevents white window on Wayland + AMD GPU.
+        # macOS has no xcb platform plugin; setting it there breaks every Qt app,
+        # RViz included.
+        *([] if platform.system() == "Darwin"
+          else [SetEnvironmentVariable("QT_QPA_PLATFORM", "xcb")]),
+        # Match ros_gz_sim's plugin search environment for ROS-installed Gazebo
+        # systems such as gz_ros2_control while bypassing its shell wrapper.
+        AppendEnvironmentVariable(
+            "IGN_GAZEBO_SYSTEM_PLUGIN_PATH", os.environ.get("LD_LIBRARY_PATH", "")),
+        AppendEnvironmentVariable(
+            "GZ_SIM_SYSTEM_PLUGIN_PATH", os.environ.get("LD_LIBRARY_PATH", "")),
+        AppendEnvironmentVariable("IGN_GAZEBO_RESOURCE_PATH", os.path.join(pkg_gz, "models")),
+        AppendEnvironmentVariable("IGN_GAZEBO_RESOURCE_PATH", os.path.join(pkg_gz, "worlds")),
+        AppendEnvironmentVariable("GZ_SIM_RESOURCE_PATH", os.path.join(pkg_gz, "models")),
+        AppendEnvironmentVariable("GZ_SIM_RESOURCE_PATH", os.path.join(pkg_gz, "worlds")),
+        OpaqueFunction(
+            function=_launch_gazebo_server,
+            args=[ign_executable, pkg_gz, ros_gz_image_bridge, ros_gz_bridge],
+        ),
+        gazebo_client,
+        OpaqueFunction(
+            function=_launch_robot,
+            args=[default_xacro, motion_profile_config, after_spawn],
+        ),
+        TimerAction(period=BRIDGE_START_DELAY, actions=[
+            ros_gz_bridge,
+            ros_gz_image_bridge,
+            OpaqueFunction(function=_camera_adapter, args=[pkg_gz]),
+            color_image_qos_relay,
+            color_camera_info_qos_relay,
+            depth_camera_info_qos_relay,
+            OpaqueFunction(function=_scan_relay, args=[pkg_gz]),
+            imu_raw_relay,
+            imu_filter,
+            joint_state_bridge,
+            joint_state_throttle,
+            cmd_vel_watchdog,
+            cmd_vel_watchdog_unbiased,
+            calculated_odometry_node,
+        ]),
+        OpaqueFunction(function=_launch_rviz),
+    ])

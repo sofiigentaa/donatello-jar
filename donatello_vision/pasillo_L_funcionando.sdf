@@ -1,0 +1,90 @@
+<?xml version='1.0' encoding='utf-8'?>
+<sdf version="1.8">
+  <model name="pasillo_L">
+    <static>true</static>
+    <link name="pared_superior">
+      <pose>0.925 0.75 0.2 0 0 0</pose>
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>2.85 0.15 0.4</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box>
+            <size>2.85 0.15 0.4</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>1 0 0 1</ambient>
+          <diffuse>1 0 0 1</diffuse>
+        </material>
+      </visual>
+    </link>
+    <link name="pared_inferior_inicio">
+      <pose>0.25 -0.75 0.2 0 0 0</pose>
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>1.5 0.15 0.4</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box>
+            <size>1.5 0.15 0.4</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>1 0 0 1</ambient>
+          <diffuse>1 0 0 1</diffuse>
+        </material>
+      </visual>
+    </link>
+    <link name="pared_fondo">
+      <pose>2.425 -1.125 0.2 0 0 0</pose>
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>0.15 3.75 0.4</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box>
+            <size>0.15 3.75 0.4</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>1 0 0 1</ambient>
+          <diffuse>1 0 0 1</diffuse>
+        </material>
+      </visual>
+    </link>
+    <link name="pared_interior_giro">
+      <pose>0.925 -1.75 0.2 0 0 0</pose>
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>0.15 2.0 0.4</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box>
+            <size>0.15 2.0 0.4</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>1 0 0 1</ambient>
+          <diffuse>1 0 0 1</diffuse>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

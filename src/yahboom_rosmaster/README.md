@@ -1,0 +1,1080 @@
+# yahboom_rosmaster
+
+> Meet **Donatello** — the little mecanum robot living in this simulated world.
+
+<p align="center">
+  <img src="docs/media/donatello-simulator.gif" alt="Donatello driving in Gazebo alongside its sensor visualization in RViz" width="100%">
+  <br>
+  <a href="docs/media/donatello-gazebo-cafe.webm">Gazebo recording</a>
+  ·
+  <a href="docs/media/donatello-rviz-sensors.webm">RViz recording</a>
+</p>
+
+![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04-orange)
+![ROS 2](https://img.shields.io/badge/ROS%202-Humble-blue)
+![Gazebo](https://img.shields.io/badge/Gazebo-Fortress%206-blue)
+
+This repository provides a Yahboom ROSMASTER X3 mecanum robot simulation for
+ROS 2 Humble and Gazebo Fortress. The supported standalone workflow includes
+contact-driven holonomic motion, wheel-state odometry, TF, 2D LiDAR, IMU data,
+and a depth point cloud, along with RGB and depth camera images and camera
+calibration messages. It also exposes timestamped simulation ground truth
+separately from robot-facing odometry.
+
+Gazebo Fortress is the reference simulator backend. A reduced Gazebo Classic
+compatibility backend is available on Apple Silicon and documented below.
+
+Ubuntu 22.04 is the fully supported platform. Apple Silicon Macs run the
+simulation natively through RoboStack — see [macOS (Apple Silicon)](#macos-apple-silicon)
+for its rendering limits and Classic compatibility backend.
+
+## Requirements
+
+- Ubuntu 22.04
+- [ROS 2 Humble](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html)
+- Gazebo Fortress 6
+- `git`, `colcon`, and `rosdep`
+
+ROS 2 Humble and Gazebo Fortress are the supported ROS/Gazebo pairing. After
+installing ROS 2 Humble, install the common workspace tools and ROS-Gazebo
+integration packages:
+
+```bash
+sudo apt update
+sudo apt install -y \
+  git \
+  python3-colcon-common-extensions \
+  python3-rosdep \
+  ros-humble-ros-gz
+```
+
+The build instructions below use `rosdep` to install the remaining dependencies
+declared by the repository packages.
+
+## Build
+
+Create a workspace and clone the repository:
+
+```bash
+mkdir -p ~/rosmaster_ws/src
+cd ~/rosmaster_ws/src
+git clone https://github.com/AIRclub-UdeSA/yahboom_rosmaster.git
+```
+
+Initialize `rosdep` once on a new machine:
+
+```bash
+sudo rosdep init
+```
+
+If `rosdep` is already initialized, skip that command. Then install dependencies
+and build from the workspace root:
+
+```bash
+cd ~/rosmaster_ws
+source /opt/ros/humble/setup.bash
+
+rosdep update
+rosdep install --from-paths src --ignore-src -r -y --rosdistro humble
+
+colcon build --symlink-install
+source install/setup.bash
+```
+
+Source both ROS 2 and the workspace overlay in every new terminal used with the
+simulator:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/rosmaster_ws/install/setup.bash
+```
+
+## Docker (Containerized Linux Simulation)
+
+For an isolated Linux environment, install Docker Engine first. GUI forwarding
+uses X11; install `xauth` on the host, and install the NVIDIA Container Toolkit
+when using an NVIDIA GPU.
+
+```bash
+cd dockerfiles
+
+./container.sh start         # build the image and start the container
+./container.sh build         # install dependencies and compile the workspace
+./container.sh sim           # launch Gazebo + RViz
+./container.sh teleop        # drive the robot from another terminal
+./container.sh stop          # stop the container
+```
+
+Use `./container.sh sim-headless` when no GUI is needed. Run
+`./container.sh doctor` to inspect the container, GPU, and X11 connection.
+
+See [`dockerfiles/README.md`](dockerfiles/README.md) for the validated flow,
+GPU/X11 requirements, and known limitations.
+
+## macOS (Apple Silicon)
+
+macOS has no ROS 2 Humble debs, so the environment comes from
+[RoboStack](https://robostack.github.io/) conda packages managed by
+[pixi](https://pixi.sh). `pixi.toml` pins ROS 2 Humble, Gazebo Fortress 6 and
+the build toolchain; `pixi.lock` makes every machine resolve identically.
+
+```bash
+brew install pixi
+
+git clone https://github.com/AIRclub-UdeSA/yahboom_rosmaster.git
+cd yahboom_rosmaster
+
+pixi install        # solve and download the ROS 2 + Gazebo environment
+pixi run build      # colcon build the simulator packages
+pixi run sim        # launch the simulation and RViz
+```
+
+`pixi run <task>` runs inside the environment, so no `source` step is needed.
+For an interactive shell with ROS 2 on the path, use `pixi shell`. Other tasks:
+`pixi run sim-headless` (no RViz), `pixi run stop` (tear down every simulation
+process), and `pixi run clean`.
+
+Verified on an M4 Max: the robot spawns and drives, mecanum strafing works, and
+`/clock`, `/joint_states`, `/odom`, `/imu/data`, `/tf` and `/cmd_vel` all behave
+as they do on Ubuntu.
+
+### Gazebo Classic backend — GUI and LiDAR on macOS
+
+The Fortress backend above cannot open a Gazebo window or produce a LiDAR scan on
+macOS (see the next section for why). A second backend runs the robot on
+**Gazebo Classic**, which provides both the Gazebo GUI and CPU-raycast LiDAR.
+
+It lives in its own folder with a single entry point and its own guide:
+
+```bash
+cd yahboom_robostack_M_silycon
+./run setup && ./run build && ./run sim
+```
+
+See [`yahboom_robostack_M_silycon/README.md`](yahboom_robostack_M_silycon/README.md)
+for the full walkthrough, including setup and teleoperation. The same simulation
+is available from the repository root as `pixi run sim-classic`.
+
+| | Fortress (`pixi run sim`) | Classic (`./run sim`) |
+| --- | --- | --- |
+| Gazebo GUI | unavailable | **works** |
+| Driving, mecanum strafe | works | works |
+| LiDAR `/scan` | unavailable | **works** (CPU raycast) |
+| Wheels spin visually | yes | no — welded |
+| Obstacles block the robot | yes | no |
+| RGB-D camera | unavailable | unavailable |
+
+`gazebo_ros_planar_move` imposes a body velocity rather than torquing the wheels,
+which is why the wheels do not turn and collisions do not stop the base. Both are
+limitations of the Classic backend; the Fortress backend on Linux remains the
+physically faithful one.
+
+The two backends are separate pixi environments because
+`ros-humble-gazebo-ros-pkgs` and `ros-humble-ros-gz` cannot be solved together,
+and they use separate build trees so neither overwrites the other.
+
+### What does not work on macOS
+
+Two things are unavailable, both from the same upstream limitation. Gazebo
+initialises its ogre2 renderer on a secondary thread, and macOS only permits
+window creation on the main thread, so the render context cannot be created:
+
+| Feature | Status |
+| --- | --- |
+| LiDAR `/scan`, RGB-D `/cam_1/*` | Unavailable — would crash the server, so the launch omits both sensors |
+| Gazebo GUI | Unavailable — `ign gazebo -g` refuses to start on macOS |
+| Everything else | Works natively |
+
+The fix for this exists only in Gazebo Garden and newer
+([gz-sim#960](https://github.com/gazebosim/gz-sim/issues/960),
+[gz-sim#1225](https://github.com/gazebosim/gz-sim/pull/1225)) and was never
+backported to Fortress. It cannot be worked around from this repository:
+`libignition-rendering6` requires `ogre-next 2.2.x`, and no conda-forge build of
+that series ships the Metal render system. Gazebo's own macOS CI has had these
+sensors failing since 2022
+([gz-rendering#654](https://github.com/gazebosim/gz-rendering/issues/654)).
+
+Newer Gazebo does carry the fix, so moving off Fortress is the only real
+alternative. That was tried and did not pan out: in a scratch RoboStack Jazzy
+environment, Gazebo Harmonic 8.10 does ship `RenderSystem_Metal` and starts
+without the macOS window error, but `gz sim -s` then hung during world load —
+with no sensors at all, and with `--iterations` set — so no sensor data was ever
+produced. Whether that hang is fixable was not investigated further; it would
+also mean leaving Humble, which the rest of this repository targets.
+
+Consequences for this backend: **RViz replaces the Gazebo GUI**, and `/scan` is
+unavailable. The Gazebo Classic backend above supplies a GUI and LiDAR when
+those simulator outputs are needed. The RGB-D camera remains unavailable on
+macOS with either backend.
+
+The launch sets these defaults automatically; to override on a Linux machine
+nothing changes, and both flags can be forced explicitly:
+
+```bash
+ros2 launch yahboom_rosmaster_gazebo rosmaster_gazebo_fortress.launch.py \
+  render_sensors:=true use_ros2_control:=true
+```
+
+### macOS-specific settings
+
+`scripts/pixi_activate.sh` exports four settings on activation. Each fixes a
+failure that otherwise looks like a hang or a network fault:
+
+- `ROS_LOCALHOST_ONLY=1` — a Mac exposes ~20 multicast interfaces (`en0`,
+  `awdl0`, `bridge0`, `utun0-5`). DDS participants pick different ones and never
+  discover each other, leaving each node with a partial ROS graph. Set it to `0`
+  after activation to reach a physical robot over the network.
+- `IGN_IP` / `GZ_IP=127.0.0.1` — the same problem in Gazebo's own transport;
+  without it `ign service -l` returns nothing.
+- `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` — the more reliable middleware here.
+- `IGN_GAZEBO_SYSTEM_PLUGIN_PATH` — Gazebo seeds its plugin search from
+  `LD_LIBRARY_PATH`, which conda never sets and macOS does not use.
+
+Two further macOS behaviours are handled inside the launch file: `ros2_control`
+is bypassed in favour of Gazebo's own `JointStatePublisher` (activating a
+controller aborts the server, because `ros2_control` waits on a condition
+variable holding an unlocked mutex and libc++ rejects that), and RViz's Camera
+display is stripped from the config (it builds a second render panel and aborts
+RViz).
+
+If a run ends badly, `pixi run stop` clears every leftover process. This matters
+more than it sounds: a stale `robot_state_publisher` creates a duplicate node
+name that breaks discovery for the next run.
+
+## Quick Start
+
+### Launch the Simulator
+
+Start the default empty world with the Gazebo GUI and RViz:
+
+```bash
+cd ~/rosmaster_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+ros2 launch yahboom_rosmaster_bringup rosmaster_x3_sim.launch.py
+```
+
+Startup is staged while Gazebo creates the robot and starts its ROS interfaces.
+Wait for these messages before checking odometry:
+
+```text
+Configured and activated joint_state_broadcaster
+Publishing wheel-state odometry from /joint_states to /odom
+```
+
+The default `stress` motion profile adds deterministic, uncalibrated wheel slip,
+roller resistance, and per-wheel asymmetry. To recover the previous zero-slip
+baseline, launch with `motion_profile:=ideal`.
+
+### Launch Without GUIs
+
+Run the Gazebo server without the Gazebo GUI or RViz:
+
+```bash
+ros2 launch yahboom_rosmaster_bringup rosmaster_x3_sim.launch.py \
+  gui:=false \
+  rviz:=false \
+  headless:=true
+```
+
+### Launch the Cafe World
+
+The repository supports the empty and cafe Fortress worlds. Launch the cafe
+world with:
+
+```bash
+ros2 launch yahboom_rosmaster_bringup rosmaster_x3_sim.launch.py \
+  world:=cafe.world
+```
+
+The cafe world ships a matching occupancy map at `maps/cafe.yaml`:
+
+| World | Occupancy map |
+|-------|---------------|
+| <img src="docs/media/maps/cafe.png" height="160"> | <img src="docs/media/maps/cafe_occupancy.png" height="160"> |
+
+### Maze Worlds
+
+The repository also ships twelve maze worlds for practice and competition
+runs -- four authored for this project and eight imported from
+[plywood_mazes](https://github.com/rfzeg/plywood_mazes). They launch the
+same way as the cafe world; a bare file name resolves inside `worlds/`:
+
+```bash
+ros2 launch yahboom_rosmaster_bringup rosmaster_x3_sim.launch.py \
+  world:=laberinto_simple.world
+```
+
+| World | Description | Automated coverage |
+|-------|-------------|---------------------|
+| `laberinto_simple.world` | Small 6x6 m maze with three internal partition walls -- ships a matching occupancy map at `maps/laberinto_simple.yaml` | `world_smoke_laberinto_simple` |
+| `laberinto_simple_victimas.world` | `laberinto_simple.world` layout plus three color-marker obstacle cubes (two red, one blue; 0.25x0.25x0.3 m, with collision) for camera/LiDAR color-detection workshops | `world_smoke_laberinto_simple_victimas` |
+| `laberinto_1.world` | Larger, more convoluted maze exported from Gazebo's Building Editor -- ships a matching occupancy map at `maps/laberinto_1.yaml` | `world_smoke_laberinto_1` |
+| `laberinto_1_victimas.world` | `laberinto_1.world` layout plus four color-marker obstacle cubes (three red, one blue; 0.25x0.25x0.3 m, one shrunk to 0.15x0.15x0.3 m to fit a ~0.31 m gap between two walls) tucked into narrow passages -- diagonal column corridor, small side room, stub-wall zigzag, and a wall gap -- so the robot has to enter a corridor before it can see and identify the color | `world_smoke_laberinto_1_victimas` |
+| `maze_1_6x5.world` | plywood_mazes maze 1, 6x5 m -- ships a matching occupancy map at `maps/maze_1_6x5.yaml` | `world_smoke_maze_1` |
+| `maze_1_6x5_victimas.world` | `maze_1_6x5.world` layout plus four color-marker obstacle cubes (two red, two blue; 0.25x0.25x0.3 m) tucked into narrow passages for camera/LiDAR color-detection workshops | `world_smoke_maze_1_victimas` |
+| `maze_2_6x5.world` | plywood_mazes maze 2, 6x5 m -- ships a matching occupancy map at `maps/maze_2_6x5.yaml` | `world_smoke_maze_2` |
+| `maze_2_6x5_victimas.world` | `maze_2_6x5.world` layout plus five color-marker obstacle cubes (three red, two blue; 0.25x0.25x0.3 m) tucked into narrow passages for camera/LiDAR color-detection workshops | `world_smoke_maze_2_victimas` |
+| `maze_3_6x6.world` | plywood_mazes maze 3, 6x6 m -- ships a matching occupancy map at `maps/maze_3_6x6.yaml` | `world_smoke_maze_3` |
+| `maze_3_6x6_victimas.world` | `maze_3_6x6.world` layout plus five color-marker obstacle cubes (three red, two blue; 0.25x0.25x0.3 m) tucked into narrow passages for camera/LiDAR color-detection workshops | `world_smoke_maze_3_victimas` |
+| `maze_4_metal_6x6.world` | plywood_mazes maze 4, metal panels, 6x6 m -- ships a matching occupancy map at `maps/maze_4_metal_6x6.yaml` | `world_smoke_maze_4` |
+| `maze_4_metal_6x6_victimas.world` | `maze_4_metal_6x6.world` layout plus four color-marker obstacle cubes (two red, two blue; 0.25x0.25x0.3 m) tucked into narrow passages for camera/LiDAR color-detection workshops | `world_smoke_maze_4_victimas` |
+
+#### Maze Previews
+
+Top-down Gazebo screenshot, its `_victimas` twin, and the occupancy map, all
+centered on the same world-frame bounding box (generate or refresh them with
+`scripts/generate_map_previews.py`):
+
+| Maze | World | Victimas | Occupancy map |
+|------|-------|----------|---------------|
+| `laberinto_simple` | <img src="docs/media/maps/laberinto_simple.png" height="160"> | <img src="docs/media/maps/laberinto_simple_victimas.png" height="160"> | <img src="docs/media/maps/laberinto_simple_occupancy.png" height="160"> |
+| `laberinto_1` | <img src="docs/media/maps/laberinto_1.png" height="160"> | <img src="docs/media/maps/laberinto_1_victimas.png" height="160"> | <img src="docs/media/maps/laberinto_1_occupancy.png" height="160"> |
+| `maze_1_6x5` | <img src="docs/media/maps/maze_1_6x5.png" height="160"> | <img src="docs/media/maps/maze_1_6x5_victimas.png" height="160"> | <img src="docs/media/maps/maze_1_6x5_occupancy.png" height="160"> |
+| `maze_2_6x5` | <img src="docs/media/maps/maze_2_6x5.png" height="160"> | <img src="docs/media/maps/maze_2_6x5_victimas.png" height="160"> | <img src="docs/media/maps/maze_2_6x5_occupancy.png" height="160"> |
+| `maze_3_6x6` | <img src="docs/media/maps/maze_3_6x6.png" height="160"> | <img src="docs/media/maps/maze_3_6x6_victimas.png" height="160"> | <img src="docs/media/maps/maze_3_6x6_occupancy.png" height="160"> |
+| `maze_4_metal_6x6` | <img src="docs/media/maps/maze_4_metal_6x6.png" height="160"> | <img src="docs/media/maps/maze_4_metal_6x6_victimas.png" height="160"> | <img src="docs/media/maps/maze_4_metal_6x6_occupancy.png" height="160"> |
+
+Walls are 0.5 m tall in all twelve -- well above the LiDAR (0.18 m above the
+floor) and camera (0.109 m), but low enough to inspect the layout from
+the Gazebo GUI.
+
+Every maze world above has a `world_smoke_*` launch test (see
+`test/world_smoke.launch.py`): headless spawn, no initial collision (the
+robot stays level, never strays more than 5 cm from its first pose during a
+3s no-command window, and stays within 10 cm of its expected (0, 0) spawn
+point), a short forward `/cmd_vel` command that must produce predominantly
+forward ground-truth displacement rather than backward or sideways motion
+(also catching a robot whose wheels spin without translating), and the core
+topics (`/odom`, `/tf`, `/joint_states`, `/scan`, `/imu/data`) coming up. This
+is intentionally lighter than the strict `sensor_contract_empty` and
+`sensor_contract_cafe` tests, which additionally assert message rates, latency,
+timestamped TF, and payload shape -- maze
+layouts share the same robot and sensor stack, so only spawn validity and
+basic movement actually vary world to world. `_victimas` worlds get the
+same smoke test as their base layout, since the color-marker cubes are the
+only new geometry to check for; any future `_victimas` world should be
+added the same way rather than getting the full contract.
+
+`simple_room.world` and `willowgarage.world` are deliberately excluded from
+this coverage -- see "Current Project Status" below, they are legacy
+migration assets, not supported practice worlds.
+
+### Simulator Launch Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `world` | `empty.world` | Bundled world filename or an absolute world path |
+| `gui` | `true` | Start the Gazebo GUI client |
+| `rviz` | `true` | Start RViz |
+| `headless` | `false` | Run the Gazebo server without its GUI client |
+| `use_sim_time` | `true` | Use the Gazebo simulation clock; keep enabled for the supported workflow |
+| `motion_profile` | `stress` | Wheel contact model: uncalibrated `stress` or zero-slip `ideal` |
+| `motion_bias` | `false` | Add randomized command drift when enabled |
+| `spawn_x` | `0.0` | Robot start x in the Gazebo world frame, in meters |
+| `spawn_y` | `0.0` | Robot start y in the Gazebo world frame, in meters |
+| `spawn_yaw` | `0.0` | Robot start heading in the Gazebo world frame, in radians (counterclockwise from +x) |
+| `ground_truth_frame` | `auto` | Ground-truth display frame: `auto`, `odom`, `map`, or another localization frame |
+| `sensor_profile` | `physical` | Sensor quality and timing: `physical` delivers the point cloud with the physical X3's gaps and latency; `ideal` delivers every frame as soon as it is built. Never changes topics, frames or layouts |
+| `sensor_seed` | `-1` | Seed of the sensor profiles' random draws. `-1` picks a random one per launch, which the camera adapter logs; tests pass a fixed one |
+| `cloud_strip_nan` | `true` | Drop non-finite points from the cloud, leaving an unorganized dense cloud, as the physical robot's adapter does by default. `false` keeps the organized 320x240 cloud |
+| `cloud_decimation` | `1` | Keep every Nth row and column of the cloud, as on the robot |
+
+The `spawn_x`/`spawn_y`/`spawn_yaw` defaults reproduce the previous fixed start
+at the world origin facing +x. On Fortress, `/odom` still starts at zero
+whatever the spawn pose, as on the physical robot; `/ground_truth/odom` reports
+the real pose in the world frame. The launch does not check that the pose is
+free: a start inside a wall or an obstacle is the caller's responsibility.
+Whether `spawn_x`/`spawn_y` equal `map` coordinates was only verified for
+`laberinto_simple`; check the other worlds before relying on it.
+
+The Gazebo Classic backend on macOS takes the same three arguments and was
+validated there (#53): no-argument and non-default spawns land at the right
+pose, `spawn_yaw` turns the robot the same way as on Fortress, and `/scan` is
+unaffected. **`/odom` does not start at zero on Classic** — it reports the
+model's absolute world pose, i.e. the spawn pose, from the first message. This
+is a backend limitation, not a bug in these launch arguments:
+`gazebo_ros_planar_move` sets body velocity directly and copies Gazebo's own
+world pose into `/odom` every update, with no wheel joints to integrate
+encoders from (the wheels are welded so ODE doesn't diverge). Fortress
+integrates simulated wheel encoders instead, so its `/odom` is dead reckoning
+that starts at zero and drifts, matching the physical robot; Classic's is
+ground truth with the `/odom` name. Code that relies on `/odom` starting at
+zero must use the Fortress backend or read `/ground_truth/odom` instead.
+
+## Controlling the Robot
+
+The public velocity-command topic is `/cmd_vel`. Positive `linear.x` moves the
+robot forward, positive `linear.y` strafes left, and positive `angular.z`
+rotates counterclockwise.
+
+### Keyboard Teleoperation
+
+Install the keyboard teleoperation package if needed:
+
+```bash
+sudo apt install -y ros-humble-teleop-twist-keyboard
+```
+
+In a second sourced terminal, run:
+
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+```
+
+Follow the program's holonomic movement bindings to drive and strafe the robot.
+
+### Direct Motion Commands
+
+The following finite commands are useful for checking each mecanum axis. Run
+them one at a time with enough free space around the robot.
+
+Move forward for approximately two seconds:
+
+```bash
+ros2 topic pub --rate 10 --times 20 /cmd_vel geometry_msgs/msg/Twist \
+  '{linear: {x: 0.20, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}'
+```
+
+Strafe left for approximately two seconds:
+
+```bash
+ros2 topic pub --rate 10 --times 20 /cmd_vel geometry_msgs/msg/Twist \
+  '{linear: {x: 0.0, y: 0.20, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}'
+```
+
+Rotate counterclockwise for approximately two seconds:
+
+```bash
+ros2 topic pub --rate 10 --times 20 /cmd_vel geometry_msgs/msg/Twist \
+  '{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.50}}'
+```
+
+## Simulator Architecture
+
+### Command Flow
+
+```text
+/cmd_vel
+  -> cmd_vel_watchdog.py
+  -> /cmd_vel_gz
+  -> ros_gz_bridge
+  -> /model/rosmaster_x3/cmd_vel
+  -> Gazebo MecanumDrive
+  -> wheel joint velocity targets
+  -> DART wheel/ground contact
+```
+
+Gazebo's native `MecanumDrive` system calculates the four wheel targets.
+`gz_ros2_control` is kept read-only for wheel and IMU state, and only
+`joint_state_broadcaster` is loaded.
+
+The watchdog saturates each component of the command to the physical driver's
+limits (±1.0 m/s on x and y, ±5.0 rad/s on yaw; `config/command_limits.yaml`),
+then adds the optional motion bias, republishes the result to the internal
+`/cmd_vel_gz` topic, and publishes zero when `/cmd_vel` has been silent for 0.5
+seconds. A component over its limit is clamped on its own, the others are not
+scaled, and a non-finite command becomes a full stop, as in the robot's driver.
+
+Wheel contact parameters come from
+`yahboom_rosmaster_gazebo/config/motion_profiles.yaml`. The default `stress`
+profile is deterministic and deliberately imperfect; it has not been fitted to
+a physical ROSMASTER X3. See
+`yahboom_rosmaster_gazebo/doc/motion_profiles.md` for values and measurements.
+
+### Odometry and TF
+
+- `base_footprint` lies on the floor and `base_link` sits 71.4 mm above it,
+  with the wheel axles 38.9 mm below `base_link`, matching the physical
+  ROSMASTER X3's description.
+- `/joint_states` is published by `joint_state_broadcaster` at 10 Hz, the
+  physical driver's rate: the controller manager's loop runs at 30 Hz and the
+  broadcaster publishes every third cycle (about 102 ms on the simulator's
+  34 ms controller steps). Its `header.frame_id` is `joint_states`, as the
+  robot's driver sets it (it was `base_link`, the broadcaster's default).
+- `/odom` is integrated from wheel joint positions by
+  `wheel_state_odometry.py`, once per `/joint_states` message, so it is also
+  10 Hz. Its covariance is the robot's: pose `0.001` and twist `0.0001` on x, y
+  and yaw only, and zero elsewhere.
+- `odom -> base_footprint` is published by `wheel_state_odometry.py`.
+- `/ground_truth/odom` is the timestamped Gazebo world pose of the simulated
+  chassis. It is measurement-only and does not publish a TF edge.
+- `ground_truth_base` is a display-only diagnostic frame published by
+  `ground_truth_tf.py` from that measurement. Its parent frame follows the
+  `ground_truth_frame` launch argument. See
+  `yahboom_rosmaster_gazebo/doc/ground_truth.md` for the fixed alignment it
+  captures and the available modes.
+- Robot link transforms are published by `robot_state_publisher`.
+
+## Working ROS Interfaces
+
+| Topic | Type | Frame / nominal rate | Purpose |
+|-------|------|----------------------|---------|
+| `/clock` | `rosgraph_msgs/msg/Clock` | — | Gazebo simulation clock |
+| `/cmd_vel` | `geometry_msgs/msg/Twist` | — | Public velocity-command input |
+| `/cmd_vel_gz` | `geometry_msgs/msg/Twist` | — | Internal watchdog output bridged to Gazebo |
+| `/joint_states` | `sensor_msgs/msg/JointState` | `joint_states` / 10 Hz | Wheel joint positions and velocities |
+| `/odom` | `nav_msgs/msg/Odometry` | `odom` -> `base_footprint` / 10 Hz | Wheel-state odometry, covariance as on the robot |
+| `/ground_truth/odom` | `nav_msgs/msg/Odometry` | `world` -> `base_footprint` / 50 Hz | Measurement-only Gazebo ground truth; not TF |
+| `/tf` | `tf2_msgs/msg/TFMessage` | — | Dynamic transforms |
+| `/tf_static` | `tf2_msgs/msg/TFMessage` | — | Static robot transforms |
+| `/scan` | `sensor_msgs/msg/LaserScan` | `laser_link` / about 7.2 Hz (stamps 139 ms apart) | 1080-sample 2D LiDAR scan with `scan_time` 0.1343 s. Under `physical` (the default) each scan arrives about 143 ms after its stamp, one period late as on the robot; under `ideal` it arrives at once |
+| `/imu/data` | `sensor_msgs/msg/Imu` | `imu_link` / 10 Hz | IMU data with an orientation estimated by `imu_filter_madgwick` (covariance `0.0025` on the diagonal), Reliable |
+| `/imu/data_raw` | `sensor_msgs/msg/Imu` | `imu_link` / 10 Hz | The IMU's acceleration and angular velocity with the noise of the physical robot's (per axis, under `physical`; none under `ideal`), the identity quaternion as orientation and all covariances zero, exactly as the robot's driver publishes it. Reliable, depth 100. Input of the filter above |
+| `/cam_1/color/image_raw` | `sensor_msgs/msg/Image` | `cam_1_color_optical_frame` / 30 Hz | 320x240 `rgb8` image |
+| `/cam_1/depth/image_raw` | `sensor_msgs/msg/Image` | `cam_1_color_optical_frame` / 30 Hz | 320x240 `32FC1` depth in metres, registered to color. A pixel with no return is NaN. Under `physical` (the default) depth reads 1.1858% short, carries noise of `max(0.002, 0.0019·d^2.36)` m and is NaN below 0.6 m; under `ideal` it is the render, unchanged |
+| `/cam_1/color/camera_info` | `sensor_msgs/msg/CameraInfo` | `cam_1_color_optical_frame` / 30 Hz | fx = fy = 271.809, (cx, cy) = (159.5, 119.5), `plumb_bob` with zero distortion |
+| `/cam_1/depth/camera_info` | `sensor_msgs/msg/CameraInfo` | `cam_1_color_optical_frame` / 30 Hz | Same as color: depth is registered to color |
+| `/cam_1/depth/color/points` | `sensor_msgs/msg/PointCloud2` | `cam_1_depth_frame` / about 8 Hz (every frame under `sensor_profile:=ideal`) | Unorganized XYZRGB cloud, 16-byte points with the NaN returns stripped. Under `physical` it arrives in gaps of whole 30 Hz frames, up to 1.1 s, about 50 ms after its stamp |
+
+The images and camera information use the ROS optical convention (+Z forward,
++X right, +Y down). The point cloud uses the regular `cam_1_depth_frame` (+X
+forward, +Y left, +Z up), as on the physical robot; TF provides the fixed
+transforms between the frames.
+
+The simulator builds its point cloud the way the physical robot does, not from
+Gazebo's own. `camera_adapter.py`, the twin of physical_rosmaster's
+`sensor_adapter.py`, pairs the color and depth images of each frame by their
+exact stamp, back-projects the depth with the color `camera_info` (Fortress
+renders both from one aperture at `cam_1_color_frame`, as the Astra registers
+its depth to color), attaches the color, transforms the points into
+`cam_1_depth_frame` and packs them: 16 bytes per point, `x`, `y`, `z` and `rgb`
+as `FLOAT32` at offsets 0, 4, 8 and 12. With `cloud_strip_nan` (the default)
+the non-finite points are dropped, leaving an unorganized cloud (`height` 1)
+that is dense. With `cloud_strip_nan:=false` the cloud stays organized, 320x240,
+and `is_dense` is false if any point is non-finite. `cloud_decimation` keeps
+every Nth row and column. The adapter also publishes `/cam_1/depth/image_raw`,
+each depth image the moment it arrives, as on the robot, whether or not its color
+image or a `camera_info` has come; a cloud is built from that same depth image,
+so the two always come from the same frame. Gazebo's own cloud is no longer
+bridged, and `/internal/cam_1/points_raw` is gone.
+
+The adapter also gives the depth the physical Astra's quality under
+`sensor_profile:=physical`, the default (#43 step 7, from physical_rosmaster's
+`docs/depth_camera_calibration.md`). For each pixel with rendered depth `z`:
+
+1. the camera reads short: `z' = z / 1.012`, a scale error of -1.1858%, the
+   inverse of the doc's recommended correction (`true ~= reported * 1.012`; the
+   doc records -1.1% to -1.3%);
+2. Gaussian noise is added, independent per pixel, with
+   `sigma(z') = max(0.002, 0.0019 * z'^2.36)` m: 2 mm up close, 25 mm at 3 m.
+   The fit is calibrated to 3.6 m and is **extrapolated** beyond it, to about 12
+   cm at 5.8 m and 25 cm at the 8 m far clip, which nothing measured;
+3. anything under 0.6 m after that is NaN: nothing below 0.6 m is ever published.
+
+The noise of a frame comes from `sensor_seed` and the frame's stamp, so a fixed
+seed repeats it and a frame that goes missing shifts no other. The published
+depth image and the cloud are built from one conditioned frame. The floor's
+dropout and the close-range wedge of the physical sensor are not modelled
+(#59). `sensor_profile:=ideal` publishes every finite pixel exactly as rendered.
+Under both profiles a pixel with no return is NaN, as the robot publishes it,
+where Gazebo has +inf beyond the far clip.
+
+`sensor_profile` sets what the cloud's timing looks like. Under `physical` (the
+default) the adapter delivers a cloud for only about one camera frame in
+three and a half. The gaps between clouds are whole 30 Hz frames drawn
+independently from the distribution measured on the robot (median 2 frames,
+p95 11, longest 34, or 1.1 s), so the rate is about 8 Hz. Each cloud is
+published 50 ms of sim time after the stamp of its frame, and keeps that stamp.
+A cloud that is ready after that goes out at once. Under `ideal` every frame
+becomes a cloud, published as soon as it is built. `sensor_seed` makes the
+gaps repeatable. The profiles and the measurement behind each value are in
+`yahboom_rosmaster_gazebo/config/sensor_profiles.yaml`. The simulator's camera
+frames come 33 ms apart, not the robot's 33.3 ms, so its gaps are 1% shorter.
+A subscriber on a loaded machine also loses some of the roughly 600 kB Best
+Effort clouds on top of the modeled gaps, about 1% on a quiet host and up to a
+third on saturated CPUs, and the robot's cloud has the same exposure.
+
+`/scan` and the five `/cam_1/*` topics above all publish Best Effort, matching
+the physical ROSMASTER X3's `qos_profile_sensor_data`/`SensorDataQoS`
+publishers (`yahboomcar_astra`, `sllidar_ros2`). Neither `ros_gz_bridge` nor
+`ros_gz_image` in this release can publish Best Effort directly, so each of
+these topics is bridged onto a private `/internal/...` name at the ROS 2
+default (Reliable), and a `sensor_qos_relay.py` instance (or, for the depth
+image and the point cloud, `camera_adapter.py`) republishes it under its public
+name at Best Effort. A consumer that subscribes Best Effort -- required for the
+physical robot -- receives no data from a Reliable-only publisher, so this
+keeps one consumer working against both environments without remaps or
+per-environment QoS overrides. `sensor_contract_probe.py` asserts this on
+every launch test via `validate_qos`. `/joint_states`, `/odom`, and
+`/imu/data` and `/imu/data_raw` remain Reliable, also matching the physical robot (the filter is the same stock `imu_filter_madgwick` node, so its Reliable `/imu/data` matches by construction; the robot's `/imu/data` QoS was not measured).
+
+The camera frames match the physical X3. `cam_1_link` and
+`cam_1_depth_frame` sit at its camera mount,
+`(0.057105, 0.000017948, 0.03755) m` from `base_link` and 109 mm above the
+floor. `cam_1_color_frame` and
+`cam_1_color_optical_frame` sit 25.1 mm to the left, at the factory
+calibration of the physical robot's Astra. The simulator publishes no
+`cam_1_infra1_*` or `cam_1_infra2_*` frames.
+
+The camera itself matches the physical Astra's interface too. Both streams
+are 320x240 at 30 Hz, with the Astra's color focal length (a 60.97 degree
+horizontal field of view) and no distortion. The Astra registers depth to
+color, and the simulator models exactly that: Fortress renders color and depth
+from one aperture at `cam_1_color_frame`, and all four image and
+camera-information topics are labelled `cam_1_color_optical_frame`, as on the
+robot. A color pixel and the depth pixel at the same coordinates see the same
+point. The principal point is the rendered image centre, (159.5, 119.5), 0.8
+and 0.6 px from the physical unit's (158.719, 120.092): Fortress cannot render
+an off-centre one. Everything else about the depth is still nominal and
+idealized under `ideal`; under the default `physical` profile it has the
+measured scale error, noise and 0.6 m minimum range (#43 step 7, above), but not
+the floor's dropout or the close-range wedge (#59). The point cloud is the
+physical adapter's, in layout and timing (#43 step 6, above).
+
+## Verify the Simulator
+
+Run these checks in a second sourced terminal after simulator startup.
+
+### Controller and Topics
+
+```bash
+ros2 control list_controllers
+
+ros2 topic list | sort | grep -E \
+  '^/(clock|cmd_vel|cmd_vel_gz|joint_states|odom|ground_truth/odom|scan|imu/data|tf|tf_static|cam_1/)'
+```
+
+The controller list should contain:
+
+```text
+joint_state_broadcaster ... active
+```
+
+The removed custom controller topic should not exist:
+
+```bash
+ros2 topic list | grep '^/mecanum_drive_controller/cmd_vel$' \
+  && echo "BAD: removed controller topic exists" \
+  || echo "OK: removed controller topic is absent"
+```
+
+### Odometry and TF
+
+```bash
+ros2 topic echo /joint_states --once
+ros2 topic echo /odom --once
+ros2 topic echo /ground_truth/odom --once
+timeout --signal=INT 5 ros2 run tf2_ros tf2_echo odom base_footprint
+```
+
+### Sensors
+
+Each command should report incoming messages:
+
+```bash
+timeout --signal=INT 5 ros2 topic hz /scan
+timeout --signal=INT 5 ros2 topic hz /imu/data
+timeout --signal=INT 5 ros2 topic hz /cam_1/color/image_raw
+timeout --signal=INT 5 ros2 topic hz /cam_1/depth/image_raw
+timeout --signal=INT 5 ros2 topic hz /cam_1/depth/color/points   # about 8 Hz, irregular
+ros2 topic echo /cam_1/color/camera_info --once
+ros2 topic echo /cam_1/depth/camera_info --once
+```
+
+The repository registers a headless contract for both supported worlds plus
+known-geometry and commanded-motion gates. Together they validate ten-message
+delivery, nominal rates, first-message latency, timestamped TF, RGB-D geometry,
+the calibrated color/depth frame offset, LiDAR geometry and handedness, IMU axes,
+mecanum wheel signs, odometry/TF agreement, and odometry
+rewind/discontinuity handling. They also verify the ground-truth topic and the
+ideal-versus-stress motion-profile contract:
+
+```bash
+colcon test --packages-select yahboom_rosmaster_gazebo \
+  --ctest-args -R '^(sensor_contract_(probe_contract|empty|empty_ideal|cafe)|cloud_timing_(physical|ideal)|depth_geometry|ground_truth_contract|motion_profile_.*|lidar_geometry|imu_(motion|noise|motion_physical)|base_feedback|wheel_odometry_resilience)$' \
+  --output-on-failure
+colcon test-result --verbose
+```
+
+Hosted CI runs `sensor_contract_ci` instead of those strict sensor-performance
+targets. It checks topic delivery, payloads, frames, the cloud's layout,
+increasing timestamps, and timestamped TF connectivity with three recent
+samples, but deliberately does not grade software-rendering throughput or
+first-arrival latency on a shared runner. It also grades 15 sim seconds of the
+cloud's timing against `sensor_profiles.yaml`, on sim time so that software
+rendering does not matter. Run `sensor_contract_empty` and
+`sensor_contract_cafe` locally before review whenever a change can affect
+sensor timing, and `cloud_timing_physical` (60 sim seconds of the cloud's gaps
+and latency) and `cloud_timing_ideal` whenever a change can affect the cloud.
+
+The twelve maze/practice worlds are covered separately by the lighter
+`world_smoke_*` tests (spawn validity, initial collisions, a forward-motion
+check, core topics -- see "Maze Worlds" above), so they are not part of the
+regex above:
+
+```bash
+colcon test --packages-select yahboom_rosmaster_gazebo \
+  --ctest-args -R '^world_smoke_.*$' \
+  --output-on-failure
+colcon test-result --verbose
+```
+
+### Command Watchdog
+
+Publish one nonzero input, wait longer than the 0.5-second timeout, and inspect
+the internal command:
+
+```bash
+ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist \
+  '{linear: {x: 0.10, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}'
+
+sleep 1
+ros2 topic echo /cmd_vel_gz --once
+```
+
+The reported twist should be zero. The robot's physical stopping time is also
+affected by the acceleration limit in the Gazebo drive plugin.
+
+## Development Checks
+
+Run the repository checks from the workspace root:
+
+```bash
+cd ~/rosmaster_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+git -C src/yahboom_rosmaster diff --check
+
+python3 -m py_compile $(find src/yahboom_rosmaster -name '*.py' \
+  -not -path '*/build/*' \
+  -not -path '*/install/*' \
+  -not -path '*/log/*')
+
+xacro src/yahboom_rosmaster/yahboom_rosmaster_description/urdf/robots/rosmaster_x3.urdf.xacro \
+  use_gazebo:=true > /tmp/rosmaster_x3.urdf
+check_urdf /tmp/rosmaster_x3.urdf
+
+colcon build --symlink-install
+colcon test
+colcon test-result --verbose --all
+rosdep check --from-paths src --ignore-src --rosdistro humble
+```
+
+The `sensor_contract_*` launch tests also run physical_rosmaster's contract
+probe against the simulator (#43 step 9). They read it with `git show` from a
+physical_rosmaster checkout at the commit pinned in
+`yahboom_rosmaster_gazebo/config/real_robot_contract.yaml`; point
+`PHYSICAL_ROSMASTER_REPO` at one (default
+`~/Documents/air-club/physical_rosmaster`, after `git fetch`). Without it they
+fail rather than skip.
+
+## Troubleshooting
+
+### Package or Launch File Not Found
+
+Source both the ROS installation and the workspace overlay in the current
+terminal:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/rosmaster_ws/install/setup.bash
+```
+
+Confirm that ROS resolves the simulator package from the expected workspace:
+
+```bash
+ros2 pkg prefix yahboom_rosmaster_gazebo
+```
+
+### Controller or Odometry Not Ready
+
+Robot creation and controller startup are staged. Wait for the controller
+activation message, then check:
+
+```bash
+ros2 control list_controllers
+ros2 topic echo /joint_states --once
+ros2 topic echo /odom --once
+```
+
+Also confirm that Gazebo is running and the simulation is not paused.
+
+### Stale Workspace Overlay
+
+If a deleted package such as `mecanum_drive_controller` still resolves, or a new
+package cannot be found, rebuild a clean workspace overlay:
+
+```bash
+cd ~/rosmaster_ws
+source /opt/ros/humble/setup.bash
+rm -rf build install log
+colcon build --symlink-install
+source install/setup.bash
+```
+
+The removed controller package should not resolve from the rebuilt workspace:
+
+```bash
+ros2 pkg prefix mecanum_drive_controller
+```
+
+### Run Without the Gazebo GUI
+
+If the Gazebo GUI cannot start in the current display environment, use the
+server-only command:
+
+```bash
+ros2 launch yahboom_rosmaster_bringup rosmaster_x3_sim.launch.py \
+  gui:=false \
+  rviz:=false \
+  headless:=true
+```
+
+## Current Project Status
+
+The supported user path is the standalone, single-robot Fortress simulator in
+the empty or cafe world. Its forward, lateral, and rotational motion,
+wheel odometry, TF, LiDAR, IMU, RGB and depth images, camera information, and
+depth point cloud have been exercised on ROS 2 Humble. The default uncalibrated
+stress profile creates measurable wheel-odometry divergence while the optional
+ideal profile preserves the previous near-zero-error baseline. Automated headless
+contracts cover both supported worlds, and isolated acceptance tests exercise
+controlled RGB-D/LiDAR geometry, IMU motion, wheel signs, odometry, ground
+truth, profile selection, and TF. The twelve maze/practice worlds each get a
+lighter `world_smoke_*` launch test covering spawn validity, initial
+collisions, a forward-motion check, and core topic liveness -- see "Maze
+Worlds" above.
+
+`ground_truth_tf.py` runs on wall time (#75, first step) instead of following
+the 1 kHz `/clock`, which cut its CPU from about 47% to 12% of a core. Its
+output is unchanged; `ros2 param get /ground_truth_tf use_sim_time` now
+reports `False`.
+
+The robot frames follow the physical ROSMASTER X3: `base_footprint` is on the
+floor and `base_link` is 71.4 mm above it. Until #42 the simulator placed
+`base_footprint` at wheel-axle height (32.5 mm up) and `base_link` at 65 mm, so
+anything that compensated for those offsets must drop the compensation. The
+camera frames follow the physical robot too (#43 step 4): `cam_1_link` moved
+from `(0.105, 0, 0.05) m` to the physical mount `(0.057105, 0.000017948, 0.03755) m`,
+the color frames moved 25.1 mm left of depth to their calibrated offset, and
+the `cam_1_infra1_*` and `cam_1_infra2_*` frames were removed. Anything that
+hard-coded the old camera pose or looked up an infra frame must be updated.
+
+**The camera changed in #43 step 5, which breaks code built against the old
+one.** Both streams went from 424x240 at 5 Hz with an 87 degree field of view
+to the physical Astra's 320x240 at 30 Hz and 60.97 degrees (fx = fy = 271.809).
+Gazebo now renders from `cam_1_color_frame`. The four image and
+camera-information topics are labelled `cam_1_color_optical_frame` instead of
+`cam_1_depth_optical_frame`. Code that reads `camera_info` and the header frame
+adapts on its own. Anything that hard-coded the old resolution, intrinsics,
+rate or image frame must be updated. The `rgbd_camera` xacro macro changed
+too: `focal_length:=` in pixels replaces `horizontal_fov:=`, which xacro now
+rejects, and the defaults are `image_width:=320` and `update_rate:=30`. The
+point cloud stays in `cam_1_depth_frame`, and changed again in step 6, below.
+
+⚠️ **The point cloud changed in #43 step 6, which breaks code built against the
+old one.** The simulator builds the cloud the way the physical robot does, and
+by default (`sensor_profile:=physical`) delivers it the way the robot does:
+
+| | Before | Now |
+|---|---|---|
+| Layout | 24-byte points, organized 320x240, Gazebo's | 16-byte points, non-finite points stripped, unorganized (`height` 1, `width` the point count), `is_dense` true; `rgb` moved from offset 16 to 12 |
+| Rate | up to 30 Hz | about 8 Hz, with gaps of whole 30 Hz frames up to about 1.1 s |
+| Latency | about 30-45 ms | 50 ms of sim time from the frame's stamp, which the cloud keeps |
+| `/internal/cam_1/points_raw` | Gazebo's cloud | removed |
+
+Code that indexed the cloud by pixel (`row * width + column`) must use
+`cloud_strip_nan:=false`, or read the points as an unorganized cloud, as it must
+on the robot. Code that assumed a cloud every frame must tolerate the gaps.
+`sensor_profile:=ideal` delivers a cloud for every camera frame as soon as it
+is built. Gaps come from `sensor_seed`, so a fixed seed repeats them, and the
+depth image is not affected: every frame is still published.
+
+⚠️ **The depth image changed in #43 step 7, which breaks code built against the
+old one.** By default (`sensor_profile:=physical`) it now has the physical
+Astra's quality, and under both profiles a pixel with no return changed from
++inf to NaN:
+
+| | Before | Now |
+|---|---|---|
+| Scale | exact | reads 1.1858% short (`z / 1.012`) under `physical` |
+| Noise | none | Gaussian, `max(0.002, 0.0019 * d^2.36)` m, from `sensor_seed` and the frame stamp; extrapolated beyond the 3.6 m the physical fit covers |
+| Below 0.6 m | returns from 0.05 m | NaN under `physical`: nothing below 0.6 m is published |
+| No return (beyond the 8 m far clip) | `+inf`, **under both profiles** | `NaN`, **under both profiles** |
+| Organized cloud (`cloud_strip_nan:=false`) | `inf` where nothing returned | `NaN` there; stripped clouds are unchanged |
+
+In the empty world the bottom 30% of the image, where the floor lies 0.25 m to
+0.6 m away, is now NaN. Code that tested `math.isinf()` for a missing return must
+test `isnan` (or `not isfinite`), as it must on the robot. Code that relied on
+depth starting at 0.05 m, or on exact distances, must use
+`sensor_profile:=ideal`, which publishes every finite pixel bit for bit. The
+floor's dropout and the close-range wedge are not modelled yet (#59).
+
+Work to match the remaining sensors to the physical robot is tracked in #43.
+`yahboom_rosmaster_gazebo/config/real_robot_contract.yaml` records the physical
+robot's measurements, the simulator's current values, and the #43 step that
+closes each difference. The sensor contract probes read their expected values
+from it; see `yahboom_rosmaster_gazebo/doc/real_robot_contract.md`.
+
+**The base changed in #43 step 8a.** `/joint_states` and `/odom` (and with it the
+`odom` -> `base_footprint` TF) now arrive at 10 Hz instead of 30 Hz, as on the
+robot, so a consumer that timed out on a gap of 50 ms or assumed a sample every
+33 ms must allow 100 ms. `/cmd_vel` is clamped to ±1.0 m/s on x and y and
+±5.0 rad/s on yaw before it reaches the drivetrain: a faster command now moves
+the robot at the limit, as the physical driver would. `/odom`'s covariance is
+the robot's, `[0.001, 0.001, 0.001]` for the pose (the yaw was 0.01) and
+`[0.0001, 0.0001, 0.0001]` for the twist (it was 0.001, 0.001, 0.01), and only
+the x, y and yaw entries are set; the z, roll and pitch variances, which were
+0.001, are now zero as on the robot. The limits are inferred from the driver's
+configuration and the covariance is marked provisional upstream
+(`x3_odometry.yaml`); both are as the physical repository records them. The
+rates, the limits and the covariance are the same under both sensor profiles.
+
+**The LiDAR changed in #43 step 8b.** `/scan` runs at about 7.2 Hz (stamps 139 ms
+apart, 7.194 Hz) instead of 5 Hz, as the robot's 7.17 Hz, and under the default
+`physical` sensor profile each scan arrives about 143 ms after the stamp it
+keeps, because it is published when the next scan arrives (the robot's scan
+comes 135.7 ms after its stamp). A consumer that waits for a scan at its
+stamp's time, or looks up TF at "now" for it, must allow for that; under
+`sensor_profile:=ideal` the scan arrives at once, at 7.2 Hz. `scan_time` is the
+robot's 0.1343 s (one sweep) under both profiles; it was 0. `time_increment`
+stays 0: the GPU LiDAR is a snapshot, and the robot's 0.1245 ms would make
+consumers such as Nav2's laser projection correct for motion that never
+happened. The first scan waits for the second and the last one before shutdown
+is never published.
+
+**The IMU changed in #43 step 8c.** `/imu/data`'s orientation is no longer
+Gazebo's: `imu_filter_madgwick`, with the robot's parameters
+(`config/imu_filter_madgwick.yaml`), estimates it from the new `/imu/data_raw`.
+As on the robot, the estimate is of `imu_link`, which is mounted upside down, so
+its roll sits near ±π (wrapping between the two) and its yaw is arbitrary: the
+filter starts from the first accelerometer sample, and with no magnetometer the
+yaw it starts at is not the world's, then drifts with gyro noise. Express it in
+`base_link` through TF before reading roll and pitch, and use yaw only as a
+change. Roll and pitch are within about 0.03 rad from the first message; there
+is no settling to wait for. The orientation covariance is `0.0025` on the
+diagonal, the angular velocity and acceleration covariances are zero as on the
+robot. Under the default `physical` profile the gyro and accelerometer noise are
+the robot's, per axis (gyro `[0.0054, 0.0051, 0.0052]` rad/s, accelerometer
+`[0.135, 0.131, 0.102]` m/s², from the stationary capture; the accelerometer's
+was 0.00175 on every axis, 75 times too small on x); under `sensor_profile:=ideal`
+there is none, so geometry and motion tests see the sensor's own reading. The
+filter runs under both profiles. `/imu/data_raw` is new and carries the robot's
+content: no Gazebo orientation, zero covariances.
+
+**⚠️ `/joint_states` `header.frame_id` changed in #43 step 9** from `base_link` to
+`joint_states`, as on the robot (the driver sets it in `Mcnamu_driver_X3.py`).
+Nothing in this repository reads it, and `robot_state_publisher` and
+`wheel_state_odometry.py` ignore it. Code that compared it with `base_link` must
+accept `joint_states`.
+
+**The simulator is checked against the robot's own contract probe in CI (#43
+step 9).** physical_rosmaster's `tools/physical_contract_probe.py` runs against
+the simulator in every `sensor_contract_*` launch test, with `target:=simulator`
+(no `/diagnostics` checks, and one `/tf_static` message instead of two; everything
+else, including topics, types, frames, QoS and rate limits, is graded as on the
+robot). CI fetches it at the commit the parity ledger pins
+(`physical.provenance.commit`). To run the launch tests locally you need a
+physical_rosmaster checkout that has that commit: set `PHYSICAL_ROSMASTER_REPO`
+to it, or keep it at `~/Documents/air-club/physical_rosmaster`. A missing
+checkout fails the test; it does not skip it.
+
+**Existing workspaces need `imu_filter_madgwick` (#43 step 8c).** The launch now
+starts it unconditionally, and a missing package aborts the whole simulator
+launch with "package 'imu_filter_madgwick' not found". After pulling, run
+`rosdep install --from-paths src --ignore-src -r -y --rosdistro humble` or
+`sudo apt install ros-humble-imu-filter-madgwick`; on a Mac, run `pixi install`
+(`pixi.toml` now lists it). A fresh setup already gets it from the Build
+section's `rosdep` command.
+
+**The macOS (Gazebo Classic) backend now limits commands with `motion_bias:=false`
+too.** Its watchdog always runs: `/cmd_vel` is clamped to ±1.0 m/s and ±5.0 rad/s
+and the robot stops 0.5 s after the last message, as on Fortress. Before, only
+`motion_bias:=true` had either. Code on the Mac that published a single
+`/cmd_vel` message and expected the robot to keep moving must publish at a rate.
+That backend publishes no IMU topic; see its README.
+
+The following simulator limitations remain:
+
+- The default drivetrain stress profile is deterministic but uncalibrated. It
+  must not be described as reproducing the physical ROSMASTER X3 until its
+  contact values are fitted against synchronized wheel odometry and external
+  ground truth. Motor, encoder, floor, latency, and battery effects remain
+  separate future calibration layers.
+- Sensor data is mostly nominal simulation output. The camera's geometry,
+  resolution, intrinsics and rate follow the physical Astra, and under the
+  default `physical` profile so do its depth's scale error, noise and 0.6 m
+  minimum range (#43 step 7). The noise fit is extrapolated beyond the 3.6 m it
+  was calibrated to. The physical sensor's floor dropout, its close-range wedge
+  and the fraction of pixels that return, which depends on the scene, are not
+  modelled (#59). The LiDAR's rate, delay and `scan_time` follow the robot (#43 step 8b), and so
+  do the IMU's noise and orientation filter (#43 step 8c).
+- The 30 Hz camera is the heaviest sensor to render. With a GPU the simulator
+  runs at about 0.95x real time. Under software rendering (llvmpipe, as on CI
+  runners), it drops to about 0.4x with 4 CPUs. The sensors keep their rates
+  in simulation time, but everything takes about 2.5 times longer in wall
+  time.
+- The LiDAR is an instantaneous snapshot model, so `time_increment` is 0 where
+  the robot's is 0.1245 ms; matching it would need a rolling-scan emulation
+  (#43 decision D3, an optional follow-up). The robot's roughly 25% ray dropout
+  is not modelled either.
+- The IMU has white Gaussian noise only, as the robot's stationary capture
+  measured it. Its bias, drift, temperature behaviour and the angular velocity
+  and acceleration covariances (zero on the robot, from the legacy bags, never
+  re-measured on the current driver) are not modelled.
+- `simple_room.world` and `willowgarage.world` are retained migration assets;
+  they are deliberately not supported Fortress worlds and are excluded from
+  automated coverage, unlike the twelve maze worlds below.
+- The twelve maze worlds (`laberinto_simple.world`, `laberinto_simple_victimas.world`,
+  `laberinto_1.world`, `laberinto_1_victimas.world`, `maze_1_6x5.world`,
+  `maze_1_6x5_victimas.world`, `maze_2_6x5.world`, `maze_2_6x5_victimas.world`,
+  `maze_3_6x6.world`, `maze_3_6x6_victimas.world`, `maze_4_metal_6x6.world`,
+  `maze_4_metal_6x6_victimas.world`) each have
+  a `world_smoke_*` launch test (spawn validity, no initial collision, a
+  forward-motion check, core topics) but not the full rate/message-shape
+  contract that the empty and cafe worlds get -- see the "Maze Worlds"
+  section above. `laberinto_simple.world`, `laberinto_1.world`,
+  `maze_1_6x5.world`, `maze_2_6x5.world`, `maze_3_6x6.world`, and
+  `maze_4_metal_6x6.world` ship a matching occupancy map
+  (`maps/laberinto_simple.yaml`, `maps/laberinto_1.yaml`, `maps/maze_1_6x5.yaml`,
+  `maps/maze_2_6x5.yaml`, `maps/maze_3_6x6.yaml`, and `maps/maze_4_metal_6x6.yaml`
+  respectively). The obstacle cubes
+  in `laberinto_simple_victimas.world`, `laberinto_1_victimas.world`,
+  `maze_1_6x5_victimas.world`, `maze_2_6x5_victimas.world`,
+  `maze_3_6x6_victimas.world`, and `maze_4_metal_6x6_victimas.world` have
+  collision but are not part of any map either -- they are meant to be
+  detected live via camera/LiDAR, not pre-mapped. Every map under `maps/` is
+  checked two ways: `map_assets_contract` parses and aligns each one against
+  its world without touching ROS, and `map_server_smoke` auto-discovers every
+  `maps/*.yaml` and drives a real `nav2_map_server` lifecycle node through
+  configure and activate for each, so a map that passes the offline parser
+  but that the actual loader rejects still gets caught. A new map needs no
+  extra wiring for either.
+- Multi-robot operation and real-hardware bringup are not provided.
+
+The 0.5-second watchdog publishes zero on normal command loss and orderly
+shutdown. It is not a safety-rated controller: abrupt watchdog failure or loss
+of its bridge can leave Gazebo retaining the last drive target until another
+command is received or the simulation is stopped.
+
+## Repository Layout
+
+| Package / Directory | Contents |
+|---------------------|----------|
+| `yahboom_rosmaster` | Repository metapackage |
+| `yahboom_rosmaster_bringup` | Canonical simulator launch entrypoints and helpers |
+| `yahboom_rosmaster_description` | Xacro/URDF, kinematic parameters, visual/collision meshes, and RViz configs |
+| `yahboom_rosmaster_gazebo` | Fortress worlds, bridge configs, simulator launch, watchdog, odometry, and test probes |
+| `yahboom_rosmaster_msgs` | Custom interface definitions |
+| `yahboom_robostack_M_silycon` | macOS Apple Silicon pixi + Gazebo Classic simulation environment |
+| `dockerfiles` | Docker container setup (`Dockerfile`, `container.sh`) for isolated Linux simulation |
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup, good first issues,
+coding style, and the pull request process.
+
+## Provenance
+
+This repository is a ROS 2 Humble and Gazebo Fortress fork of
+[Automatic Addison's `yahboom_rosmaster`](https://github.com/automaticaddison/yahboom_rosmaster)
+repository. The current fork is maintained at
+[`AIRclub-UdeSA/yahboom_rosmaster`](https://github.com/AIRclub-UdeSA/yahboom_rosmaster).
+
+## License
+
+The packages are distributed under the BSD-3-Clause license. Each package
+contains its own `LICENSE` file.
