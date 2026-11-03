@@ -1,5 +1,6 @@
-FROM ros:humble-desktop-jammy
+FROM ros:humble-ros-base-jammy
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ROS_DISTRO=humble
 
@@ -11,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-colcon-common-extensions \
     python3-rosdep \
     python3-pip \
+    python3-numpy \
+    python3-opencv \
     xauth \
     mesa-utils \
     && curl -fsSL https://packages.osrfoundation.org/gazebo.gpg \
@@ -19,15 +22,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
        > /etc/apt/sources.list.d/gazebo-stable.list \
     && apt-get update && apt-get install -y --no-install-recommends \
     ignition-fortress \
-    ros-humble-ros-gz \
-    ros-humble-ros2-control \
-    ros-humble-ros2-controllers \
-    ros-humble-gz-ros2-control \
-    ros-humble-cv-bridge \
-    ros-humble-xacro \
-    ros-humble-tf-transformations \
-    ros-humble-teleop-twist-keyboard \
     && rm -rf /var/lib/apt/lists/*
+
+# Resolve dependencies from every ROS package manifest so the bind-mounted
+# workspace can be built and tested in a fresh container.
+COPY src/yahboom_rosmaster/yahboom_rosmaster/package.xml \
+     /tmp/donatello-rosdep/src/yahboom_rosmaster/package.xml
+COPY src/yahboom_rosmaster/yahboom_rosmaster_bringup/package.xml \
+     /tmp/donatello-rosdep/src/yahboom_rosmaster_bringup/package.xml
+COPY src/yahboom_rosmaster/yahboom_rosmaster_description/package.xml \
+     /tmp/donatello-rosdep/src/yahboom_rosmaster_description/package.xml
+COPY src/yahboom_rosmaster/yahboom_rosmaster_gazebo/package.xml \
+     /tmp/donatello-rosdep/src/yahboom_rosmaster_gazebo/package.xml
+COPY src/yahboom_rosmaster/yahboom_rosmaster_msgs/package.xml \
+     /tmp/donatello-rosdep/src/yahboom_rosmaster_msgs/package.xml
+
+RUN if [[ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]]; then \
+      rosdep init; \
+    fi \
+    && rosdep update --rosdistro humble \
+    && apt-get update \
+    && rosdep install \
+      --from-paths /tmp/donatello-rosdep/src \
+      --ignore-src \
+      --rosdistro humble \
+      --default-yes \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /tmp/donatello-rosdep
 
 WORKDIR /root/donatello_ws
 

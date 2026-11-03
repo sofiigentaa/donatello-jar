@@ -1,0 +1,14 @@
+**
+!Dockerfile
+!src
+!src/yahboom_rosmaster
+!src/yahboom_rosmaster/yahboom_rosmaster
+!src/yahboom_rosmaster/yahboom_rosmaster/package.xml
+!src/yahboom_rosmaster/yahboom_rosmaster_bringup
+!src/yahboom_rosmaster/yahboom_rosmaster_bringup/package.xml
+!src/yahboom_rosmaster/yahboom_rosmaster_description
+!src/yahboom_rosmaster/yahboom_rosmaster_description/package.xml
+!src/yahboom_rosmaster/yahboom_rosmaster_gazebo
+!src/yahboom_rosmaster/yahboom_rosmaster_gazebo/package.xml
+!src/yahboom_rosmaster/yahboom_rosmaster_msgs
+!src/yahboom_rosmaster/yahboom_rosmaster_msgs/package.xml

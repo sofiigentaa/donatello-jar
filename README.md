@@ -10,13 +10,24 @@ Proyecto de robot autónomo con **ROS 2 Humble**, **Gazebo Fortress** y el robot
 
 **Advertencia:** `donatello_vision/seguir_pasillo.py` fue creado para el pasillo en L; contiene una meta fija `y <= -2.30` y giros a la derecha. **No ejecutarlo sin adaptación en el laberinto nuevo.** El mundo de práctica no está confirmado como mapa oficial.
 
+**Contrato de competencia:** la entrega JAR 2026 se realiza como un fork del
+[template oficial](https://github.com/AIRclub-UdeSA/jar_challenge), no desde este
+repositorio de simulación. El equipo debe arrancar con
+`equipo_jar.competencia.launch.py`, recibir `victimas:=N` y esperar `/map`
+antes de mover o reportar. `/victimas` usa `geometry_msgs/msg/PointStamped`
+con `frame_id: map`; `/done` usa `std_msgs/msg/Empty`. No se permite usar
+`/ground_truth/odom` como localización de competencia. Este repositorio conserva
+mundos, mapas y herramientas de simulación para desarrollo; no copiarlo entero
+al fork de entrega. Verificar siempre el
+[reglamento vigente](https://airclub-udesa.github.io/jar_site/reglamento/).
+
 ## Archivos
 
 - `src/yahboom_rosmaster/`: paquetes ROS, modelos, mundos y lanzadores de simulación.
 - `donatello_vision/`: controladores Python desarrollados.
 - `donatello_vision_respaldo_etapa4/`: respaldos.
-- `Dockerfile`: primera versión de entorno de desarrollo.
-- `compose.yaml`: primera versión de ejecución con Docker.
+- `Dockerfile` y `compose.yaml`: entorno Docker raíz para el workspace, con las
+  dependencias ROS resueltas desde los manifiestos de los paquetes.
 
 ## Para un compañero con Windows 11
 
@@ -42,7 +53,8 @@ docker compose run --rm donatello
 
 Reemplazar `URL_DEL_REPOSITORIO` por la URL real del repositorio una vez publicado. **El Dockerfile y Compose todavía no están validados en Windows.**
 
-Ya **dentro del contenedor**:
+El Dockerfile raíz instala las dependencias declaradas por los paquetes ROS al
+construir la imagen. Ya **dentro del contenedor**:
 
 ```bash
 source /opt/ros/humble/setup.bash

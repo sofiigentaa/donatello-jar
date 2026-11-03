@@ -8,6 +8,8 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 
 
+# Prototipo de etapa 4: solo valido para el pasillo en L de practica.
+# TODO JAR: reemplazar la localizacion de ground truth por mapa, odometria y sensores oficiales.
 class ControlObstaculos(Node):
     def __init__(self):
         super().__init__('control_obstaculos')
@@ -39,6 +41,7 @@ class ControlObstaculos(Node):
         self.get_logger().info('Control de obstaculos iniciado')
 
     def verificar_llegada(self, msg):
+        # TODO JAR: terminar por estado de mision, no por una coordenada fija del mapa.
         if msg.pose.pose.position.y <= -2.30:
             if not self.llegada_alcanzada:
                 self.get_logger().info('META ALCANZADA: Donatello detenido')
@@ -111,6 +114,7 @@ class ControlObstaculos(Node):
 
             if minimo < self.distancia_seguridad:
                 if self.estado_movimiento != "GIRAR":
+                    # TODO JAR: elegir el camino con exploracion/planificacion, no forzar derecha.
                     self.direccion_giro = -1.0  # Giro a la derecha para el pasillo en L
                 self.estado_movimiento = "GIRAR"
                 self.obstaculo_detectado = True

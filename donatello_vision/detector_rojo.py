@@ -41,6 +41,8 @@ class DetectorRojo(Node):
 
         mascara = mascara1 | mascara2
 
+        # TODO JAR: validar el color frente a distractores y confirmar detecciones en varios frames.
+
         contornos, _ = cv2.findContours(
             mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -49,6 +51,7 @@ class DetectorRojo(Node):
             area = max(cv2.contourArea(c) for c in contornos)
 
             if area > 500:
+                # TODO JAR: estimar el centro en el piso con RGB-D y TF; publicar PointStamped en /victimas.
                 self.get_logger().info(
                     f'Posible objeto rojo detectado. �rea: {area:.0f} p�xeles'
                 )
